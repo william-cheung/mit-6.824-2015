@@ -1,4 +1,4 @@
-#MIT 6.824 - Distributed Systems - Spring 2015
+##MIT 6.824 - Distributed Systems - Spring 2015 
 
 * Lab 1: MapReduce; The Go Programming Language
 
