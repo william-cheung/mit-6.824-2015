@@ -30,5 +30,6 @@ func (mr *MapReduce) KillWorkers() *list.List {
 
 func (mr *MapReduce) RunMaster() *list.List {
 	// Your code here
+
 	return mr.KillWorkers()
 }
