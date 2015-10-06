@@ -21,12 +21,12 @@ type ViewServer struct {
 
 
 	// Your declarations here.
-	view     *View
-	newv     *View
-	packed   bool
-	palive   int
-	balive   int
-	svrset   map[string]int
+	view     *View                 // current view				
+	newv     *View                 // new view
+	packed   bool                  // is current view acked by the primary
+	pttl     int                   // ttl of current primary
+	bttl     int                   // ttl of current backup 
+	svrset   map[string]int        // extra servers, server address -> ttl
 }
 
 func create_view(viewno uint, primary string, backup string) (view *View) {
@@ -38,11 +38,21 @@ func create_view(viewno uint, primary string, backup string) (view *View) {
 }
 
 func (vs *ViewServer) is_primary_dead() bool {
-	return vs.palive <= 0 || vs.view.Primary == ""
+	return vs.pttl <= 0
 }
 
 func (vs *ViewServer) is_backup_dead() bool {
-	return vs.balive <= 0 || vs.view.Backup == ""
+	return vs.bttl <= 0
+}
+
+func (vs *ViewServer) print_view() {
+	if vs.view == nil {
+		log.Printf("no view in the view server\n");
+	} else {
+		log.Printf("viewno  %d\n", vs.view.Viewnum)
+		log.Printf("primary %s\n", vs.view.Primary)
+		log.Printf("backup  %s\n", vs.view.Backup)
+	}
 }
 
 //
@@ -56,51 +66,45 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 	client := args.Me
 	viewno := args.Viewnum
 	log.Printf("RPC : viewno %d, client %s\n", viewno, client);
-	if vs.view == nil {
-		log.Printf("view is nil\n");
-	} else {
-		log.Printf("viewno  %d\n", vs.view.Viewnum)
-		log.Printf("primary %s\n", vs.view.Primary)
-		log.Printf("backup  %s\n", vs.view.Backup)
-	}
+	
+	vs.print_view()
+	
 	if viewno == 0 {
 		if vs.view == nil {
+			// first server, let it be the primary
 			vs.view = create_view(1, client, "")
 		} else {
 			// restarted p is treated as dead
 			if client == vs.view.Primary { 
 				log.Printf("primary was restarted\n");
-				vs.palive = 0; // set dead
+				vs.pttl = 0;
 				if (vs.packed && vs.switch_to_new_view()) {
 					vs.packed = false
 				}
 			} 
 			if client != vs.view.Backup {
+				// extra servers
 				vs.svrset[client] = DeadPings
 			}
 		}
 	} else {
-		//log.Printf("viewno != 0 : client %s, primary %s\n", client, vs.view.Primary)
 		if client == vs.view.Primary {
 			if viewno == vs.view.Viewnum {
-				if (vs.newv != nil) {
-					log.Printf("switch to new view in RPC Ping\n");
-					vs.view, vs.newv = vs.newv, nil
+				if (vs.do_view_switch()) {
+					//log.Printf("switch to new view in RPC Ping\n");
 					vs.packed = false
 				} else {
 					log.Printf("primary Acked the %d-th view\n", viewno);
 					vs.packed = true
 				}
-			} else {
-				//return errors.New("ViewServer : RPC Ping error : viewno dismatch");
 			}
 		}
 	}
 
 	if client == vs.view.Primary {
-		vs.palive = DeadPings
+		vs.pttl = DeadPings
 	} else if client == vs.view.Backup {
-		vs.balive = DeadPings
+		vs.bttl = DeadPings
 	}
 	
 	reply.View = *vs.view
@@ -152,8 +156,13 @@ func (vs *ViewServer) switch_to_new_view() bool {
 		vs.update_newv(
 			vs.view.Backup, get_and_del(&vs.svrset))
 	} else if vs.is_primary_dead() && vs.is_backup_dead() {
+		// uninitialized servers cannot be promoted to primary
 		vs.update_newv("", "")
 	}
+	return vs.do_view_switch()
+}
+
+func (vs *ViewServer) do_view_switch() bool {
 	if vs.newv != nil {
 		vs.view, vs.newv = vs.newv, nil
 		return true
@@ -184,11 +193,11 @@ func (vs *ViewServer) tick() {
 		vs.packed = false
 	}
 
-	if vs.view.Primary == "" { vs.palive = 0 }
-	if vs.view.Backup  == "" { vs.balive = 0 }
+	if vs.view.Primary == "" { vs.pttl = 0 }
+	if vs.view.Backup  == "" { vs.bttl = 0 }
 
-	if vs.palive > 0 { vs.palive-- }
-	if vs.balive > 0 { vs.balive-- }
+	if vs.pttl > 0 { vs.pttl-- }
+	if vs.bttl > 0 { vs.bttl-- }
 }
 
 //
