@@ -12,7 +12,7 @@ import "os"
 import "syscall"
 import "math/rand"
 
-const Debug = 1
+const Debug = 0
 func debug_printf(format string, a ...interface{}) {
 	if Debug > 0 {
 		log.Printf(format, a...)
@@ -74,13 +74,13 @@ func (pb *PBServer) filter_duplicate(opid int64, method string, preply interface
 		return false
 	}
 	
-	debug_printf("duplicate Append detected, opid : %v, op : %s\n", opid, method)
+	debug_printf("duplicate op detected, opid : %v, op : %s\n", opid, method)
 	rp, ok2 := pb.replies[opid]
 	if !ok2 {
 		return false
 	}
 
-	// bad design, because there may be 
+	// bad design, because there would be many types of operations to be filtered 
 	if method == Get {
 		rpptr, ok1 := preply.(**GetReply)
 		saved, ok2 := rp.(*GetReply) 
@@ -104,6 +104,20 @@ func (pb *PBServer) filter_duplicate(opid int64, method string, preply interface
 func (pb *PBServer) record_operation(opid int64, reply interface{}) {
 	pb.filters[opid] = FilterLife
 	pb.replies[opid] = reply
+}
+
+func (pb *PBServer) backup_put(key string, value string) {
+/*	if pb.get_backup() == "" {
+		return
+	}
+	args := &PutAppendArgs{}
+	args.Key, args.Value = key, value
+	args.Viewnum = pb.get_viewno()
+	args.OpID = nrand()
+	args.Client = pb.me
+	var reply PutAppendReply
+	call(pb.get_backup(), "PBServer.PutAppend", args, &reply)
+*/
 }
 
 func (pb *PBServer) aux_kvs_op(client string, viewno uint, op string) (errx Err, cont bool) {
@@ -145,10 +159,28 @@ func (pb *PBServer) InitKvs(args *InitKvsArgs, reply *InitKvsReply) error {
 	return nil
 }
 
+func (pb *PBServer) do_get(args *GetArgs, reply *GetReply) error {
+	key := args.Key
+	value, ok := pb.kvstore[key]
+	if ok {
+		reply.Err = OK
+		reply.Value = value
+	} else {
+		reply.Err = ErrNoKey
+	}
+	return nil
+}
+
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
-	
+
+	ok := pb.filter_duplicate(args.OpID, Get, &reply)
+	if ok {
+		debug_printf("Duplicate : reply.Err : %s\n", reply.Err)
+		return nil
+	}
+
 	client, vnc := args.Client, args.Viewnum
 	errx, cont := pb.aux_kvs_op(client, vnc, "Get")
 	if !cont {
@@ -158,33 +190,49 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 
 	// if we are primary, forward the request to backup
 	if pb.me == pb.get_primary() && pb.get_backup() != "" {
-		args.Client, args.Viewnum = pb.me, pb.get_viewno()
-		// suppose that backup always holds same data with primary
 		debug_printf("forward the request to backup %s\n", pb.get_backup());
+		
+		args.Client, args.Viewnum = pb.me, pb.get_viewno()
 		call(pb.get_backup(), "PBServer.Get", args, reply)
+		
 		// if we have a wrong view, then get view from the ViewServer 
 		if reply.Err == ErrWrongServer { 
 			if !pb.get_view() {
 				// fatal error
 			}
+			return nil
 		} 
 		if reply.Err == ErrUninitServer {
 			pb.init_backup()
-		} else {
-			return nil
 		}
-	} 
-
-	debug_printf("--- key : %s\n", args.Key)
-	
-	key := args.Key
-	value, ok := pb.kvstore[key]
-	if ok {
-		reply.Err = OK
-		reply.Value = value
-	} else {
-		reply.Err = ErrNoKey
 	}
+
+	var myreply GetReply
+	pb.do_get(args, &myreply)
+	if !comp_GetReply(reply, &myreply) {
+		if (myreply.Err == OK) {
+			pb.backup_put(args.Key, myreply.Value)
+		}
+		copy_GetReply(reply, &myreply)
+	}
+
+	pb.record_operation(args.OpID, reply)
+
+	return nil
+}
+
+func (pb *PBServer) do_putappend(args *PutAppendArgs, reply *PutAppendReply) error {
+	debug_printf("--- op : %s, key : %s, value : %s\n", args.Method, args.Key, args.Value)
+	
+	key, value := args.Key, args.Value
+	method := args.Method
+	if method == Put {
+		pb.kvstore[key] = value
+	} else if method == Append {
+		pb.kvstore[key] += value
+	} 
+	reply.Err = OK
+
 	return nil
 }
 
@@ -204,13 +252,13 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 		return nil
 	}
 
-	initb := false
 	// if we are primary, forward the request to backup
 	if pb.me == pb.get_primary() && pb.get_backup() != "" {
-		args.Client, args.Viewnum = pb.me, pb.get_viewno()
-		// suppose that backup always holds same data with primary
 		debug_printf("forward the request to backup %s\n", pb.get_backup());
+		
+		args.Client, args.Viewnum = pb.me, pb.get_viewno()
 		call(pb.get_backup(), "PBServer.PutAppend", args, reply)
+		
 		// if we have a wrong view, then get view from the ViewServer 
 		if reply.Err == ErrWrongServer {
 			if !pb.get_view() {
@@ -219,32 +267,21 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 			return nil
 		} 
 		if reply.Err == ErrUninitServer {
-			initb = true
+			pb.do_putappend(args, reply)
+			pb.init_backup()
+			return nil
 		} 
 	} 
 
-	debug_printf("--- key : %s, value : %s\n", args.Key, args.Value)
-	
-	key, value := args.Key, args.Value
-	method, opid := args.Method, args.OpID
-	if method == Put {
-		pb.kvstore[key] = value
-	} else if method == Append {
-		pb.kvstore[key] += value
-	} 
-	reply.Err = OK
+	pb.do_putappend(args, reply)
 
-	if initb {
-		pb.init_backup()
-	}	
-	
-	pb.record_operation(opid, reply)
+	pb.record_operation(args.OpID, reply)
 
 	return nil
 }
 
 
-func (pb *PBServer) do_ping() {
+func (pb *PBServer) ping_viewserver() {
 	viewno := uint(0)
 	if pb.view != nil {
 		viewno = pb.view.Viewnum
@@ -276,7 +313,7 @@ func (pb *PBServer) tick() {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 	
-	pb.do_ping()
+	pb.ping_viewserver()
 	pb.clean_filters()
 }
 

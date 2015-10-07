@@ -1,10 +1,9 @@
 package pbservice
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrDuplicate   = "ErrDuplicate"
-	ErrWrongServer = "ErrWrongServer"
+	OK              = "OK"
+	ErrNoKey        = "ErrNoKey"
+	ErrWrongServer  = "ErrWrongServer"
 	ErrUninitServer = "ErrUninitServer"
 )
 
@@ -26,8 +25,8 @@ type PutAppendArgs struct {
 	Client   string
 	Viewnum	 uint
 	Method   string
-
 	OpID     int64
+
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 }
@@ -51,6 +50,7 @@ type GetReply struct {
 
 
 // Your RPC definitions here.
+
 type InitKvsArgs struct {
 	Kvstore map[string]string
 }
@@ -60,11 +60,20 @@ type InitKvsReply struct {
 }
 
 
-// utility funcs
+// Utility funcs
 func copy_GetReply(dst *GetReply, src *GetReply) {
 	dst.Err = src.Err
 	dst.Value = src.Value
 }
+
 func copy_PutAppendReply(dst *PutAppendReply, src *PutAppendReply) {
 	dst.Err = src.Err
+}
+
+func comp_GetReply(r1 *GetReply, r2 *GetReply) bool {
+	return r1.Value == r2.Value
+}
+
+func comp_PutAppendReply(r1 *PutAppendReply, r2 *PutAppendReply) bool {
+	return r1.Err == r2.Err
 }

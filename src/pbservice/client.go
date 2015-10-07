@@ -8,12 +8,14 @@ import "crypto/rand"
 import "math/big"
 
 import "time"
+import "sync"
 
 type Clerk struct {
 	vs *viewservice.Clerk
 	// Your declarations here
-	me string
-	view *viewservice.View
+	mu    sync.Mutex
+	me    string
+	view  *viewservice.View
 }
 
 // this may come in handy.
@@ -99,18 +101,29 @@ func (ck *Clerk) get_viewno() uint {
 //
 func (ck *Clerk) Get(key string) string {
 	// Your code here.
+
 	args := &GetArgs{Key:key}
-	args.Client, args.Viewnum = ck.me, ck.get_viewno()
+	args.Client = ck.me
 	args.OpID = nrand()
+	
 	var reply GetReply
+	
 	userpc := false
 	for {
-		call(ck.get_primary(userpc), "PBServer.Get", args, &reply)
+		ck.mu.Lock()
+		primary := ck.get_primary(userpc)
+		viewno  := ck.get_viewno()
+		ck.mu.Unlock()
+
+		args.Viewnum = viewno
+		call(primary, "PBServer.Get", args, &reply)
+		
 		if reply.Err == OK || reply.Err == ErrNoKey {
 			return reply.Value
 		} else {
 			userpc = true
 		}
+		
 		time.Sleep(viewservice.PingInterval)
 	}
 	return "???"
@@ -121,18 +134,29 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// Your code here.
+	
 	args := &PutAppendArgs{Key:key, Value:value, Method:op}
-	args.Client, args.Viewnum = ck.me, ck.get_viewno()
+	args.Client = ck.me
 	args.OpID = nrand()
+	
 	var reply PutAppendReply
+	
 	userpc := false
 	for {
-		call(ck.get_primary(userpc), "PBServer.PutAppend", args, &reply)
-		debug_printf("client : opid %v, op %s, reply.Err %s\n", args.OpID, op, reply.Err)
+		ck.mu.Lock()
+		primary := ck.get_primary(userpc)
+		viewno  := ck.get_viewno()
+		ck.mu.Unlock()
+
+		args.Viewnum = viewno
+		call(primary, "PBServer.PutAppend", args, &reply)
+		
 		if reply.Err == OK {
 			break
-		} 
-		userpc = true
+		} else {
+			userpc = true
+		}
+
 		time.Sleep(viewservice.PingInterval)
 	}
 }
