@@ -10,7 +10,14 @@ import "os"
 import "sync/atomic"
 
 //import "container/list"
-import "errors"
+//import "errors"
+
+const Debug = 0
+func debug_printf(format string, a ...interface{}) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+}
 
 type ViewServer struct {
 	mu       sync.Mutex
@@ -47,11 +54,11 @@ func (vs *ViewServer) is_backup_dead() bool {
 
 func (vs *ViewServer) print_view() {
 	if vs.view == nil {
-		log.Printf("no view in the view server\n");
+		debug_printf("no view in the view server\n");
 	} else {
-		log.Printf("viewno  %d\n", vs.view.Viewnum)
-		log.Printf("primary %s\n", vs.view.Primary)
-		log.Printf("backup  %s\n", vs.view.Backup)
+		debug_printf("viewno  %d\n", vs.view.Viewnum)
+		debug_printf("primary %s\n", vs.view.Primary)
+		debug_printf("backup  %s\n", vs.view.Backup)
 	}
 }
 
@@ -65,7 +72,7 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
 	client := args.Me
 	viewno := args.Viewnum
-	log.Printf("RPC : viewno %d, client %s\n", viewno, client);
+	debug_printf("RPC : viewno %d, client %s\n", viewno, client);
 	
 	vs.print_view()
 	
@@ -76,7 +83,7 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 		} else {
 			// restarted p is treated as dead
 			if client == vs.view.Primary { 
-				log.Printf("primary was restarted\n");
+				debug_printf("primary was restarted\n");
 				vs.pttl = 0;
 				if (vs.packed && vs.switch_to_new_view()) {
 					vs.packed = false
@@ -91,10 +98,10 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 		if client == vs.view.Primary {
 			if viewno == vs.view.Viewnum {
 				if (vs.do_view_switch()) {
-					//log.Printf("switch to new view in RPC Ping\n");
+					//debug_printf("switch to new view in RPC Ping\n");
 					vs.packed = false
 				} else {
-					log.Printf("primary Acked the %d-th view\n", viewno);
+					debug_printf("primary Acked the %d-th view\n", viewno);
 					vs.packed = true
 				}
 			}
@@ -105,6 +112,8 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 		vs.pttl = DeadPings
 	} else if client == vs.view.Backup {
 		vs.bttl = DeadPings
+	} else {
+		vs.svrset[client] = DeadPings
 	}
 	
 	reply.View = *vs.view
@@ -120,9 +129,11 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 	defer vs.mu.Unlock()
 
 	if vs.view == nil {
-		return errors.New("ViewServer : RPC Get error : no view created yet")
-	}
-	reply.View = *vs.view
+		//return errors.New("ViewServer : RPC Get error : no view created yet")
+		reply.View = *create_view(0, "", "")
+	} else {
+		reply.View = *vs.view
+	}	
 	return nil
 }
 
@@ -139,7 +150,7 @@ func (vs *ViewServer) update_newv(primary string, backup string) {
 func get_and_del(m *map[string]int) string {
 	for elem := range *m {
 		delete(*m, elem)
-		log.Printf("select server : %s\n", elem);
+		debug_printf("select server : %s\n", elem);
 		return elem
 	}
 	return ""
@@ -195,7 +206,7 @@ func (vs *ViewServer) tick() {
 
 	if vs.view.Primary == "" { vs.pttl = 0 }
 	if vs.view.Backup  == "" { vs.bttl = 0 }
-
+	
 	if vs.pttl > 0 { vs.pttl-- }
 	if vs.bttl > 0 { vs.bttl-- }
 }
