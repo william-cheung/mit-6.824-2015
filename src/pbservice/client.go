@@ -7,10 +7,13 @@ import "fmt"
 import "crypto/rand"
 import "math/big"
 
+import "time"
 
 type Clerk struct {
 	vs *viewservice.Clerk
 	// Your declarations here
+	me string
+	view *viewservice.View
 }
 
 // this may come in handy.
@@ -25,7 +28,7 @@ func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
 	// Your ck.* initializations here
-
+	ck.me = me
 	return ck
 }
 
@@ -64,6 +67,29 @@ func call(srv string, rpcname string,
 	return false
 }
 
+func (ck *Clerk) get_view(userpc bool) *viewservice.View {
+	if ck.view == nil || userpc {
+		v, ok := ck.vs.Get() 
+		if ok { 
+			ck.view = &v  
+		} else { ck.view = nil }
+	} 
+	return ck.view
+}
+
+func (ck *Clerk) get_primary(userpc bool) string {
+	v := ck.get_view(userpc)
+	if v != nil { return v.Primary }
+	return ""
+}
+
+func (ck *Clerk) get_viewno() uint {
+	if ck.get_view(false) != nil {
+		return ck.view.Viewnum
+	} 
+	return 0
+}
+
 //
 // fetch a key's value from the current primary;
 // if they key has never been set, return "".
@@ -72,9 +98,21 @@ func call(srv string, rpcname string,
 // says the key doesn't exist (has never been Put().
 //
 func (ck *Clerk) Get(key string) string {
-
 	// Your code here.
-
+	args := &GetArgs{Key:key}
+	args.Client, args.Viewnum = ck.me, ck.get_viewno()
+	args.OpID = nrand()
+	var reply GetReply
+	userpc := false
+	for {
+		call(ck.get_primary(userpc), "PBServer.Get", args, &reply)
+		if reply.Err == OK || reply.Err == ErrNoKey {
+			return reply.Value
+		} else {
+			userpc = true
+		}
+		time.Sleep(viewservice.PingInterval)
+	}
 	return "???"
 }
 
@@ -82,8 +120,21 @@ func (ck *Clerk) Get(key string) string {
 // send a Put or Append RPC
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-
 	// Your code here.
+	args := &PutAppendArgs{Key:key, Value:value, Method:op}
+	args.Client, args.Viewnum = ck.me, ck.get_viewno()
+	args.OpID = nrand()
+	var reply PutAppendReply
+	userpc := false
+	for {
+		call(ck.get_primary(userpc), "PBServer.PutAppend", args, &reply)
+		debug_printf("client : opid %v, op %s, reply.Err %s\n", args.OpID, op, reply.Err)
+		if reply.Err == OK {
+			break
+		} 
+		userpc = true
+		time.Sleep(viewservice.PingInterval)
+	}
 }
 
 //
@@ -91,7 +142,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 // must keep trying until it succeeds.
 //
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, Put)
 }
 
 //
@@ -99,5 +150,5 @@ func (ck *Clerk) Put(key string, value string) {
 // must keep trying until it succeeds.
 //
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, Append)
 }
