@@ -1,0 +1,201 @@
+package pbservice
+
+import "viewservice"
+import "fmt"
+import "io"
+import "net"
+import "testing"
+import "time"
+import "log"
+import "runtime"
+//import "math/rand"
+import "os"
+//import "sync"
+import "strconv"
+//import "strings"
+import "sync/atomic"
+
+func check(ck *Clerk, key string, value string) {
+	v := ck.Get(key)
+	if v != value {
+		log.Fatalf("Get(%v) -> %v, expected %v", key, v, value)
+	}
+}
+
+func port(tag string, host int) string {
+	s := "/var/tmp/824-"
+	s += strconv.Itoa(os.Getuid()) + "/"
+	os.Mkdir(s, 0777)
+	s += "pb-"
+	s += strconv.Itoa(os.Getpid()) + "-"
+	s += tag + "-"
+	s += strconv.Itoa(host)
+	return s
+}
+
+
+
+func proxy(t *testing.T, port string, delay *int32) {
+	portx := port + "x"
+	os.Remove(portx)
+	if os.Rename(port, portx) != nil {
+		t.Fatalf("proxy rename failed")
+	}
+	l, err := net.Listen("unix", port)
+	if err != nil {
+		t.Fatalf("proxy listen failed: %v", err)
+	}
+	go func() {
+		defer l.Close()
+		defer os.Remove(portx)
+		defer os.Remove(port)
+		for {
+			c1, err := l.Accept()
+			if err != nil {
+				t.Fatalf("proxy accept failed: %v\n", err)
+			}
+			time.Sleep(time.Duration(atomic.LoadInt32(delay)) * time.Second)
+			c2, err := net.Dial("unix", portx)
+			if err != nil {
+				t.Fatalf("proxy dial failed: %v\n", err)
+			}
+
+			go func() {
+				for {
+					buf := make([]byte, 1000)
+					n, _ := c2.Read(buf)
+					if n == 0 {
+						break
+					}
+					n1, _ := c1.Write(buf[0:n])
+					if n1 != n {
+						break
+					}
+				}
+			}()
+			for {
+				buf := make([]byte, 1000)
+				n, err := c1.Read(buf)
+				if err != nil && err != io.EOF {
+					t.Fatalf("proxy c1.Read: %v\n", err)
+				}
+				if n == 0 {
+					break
+				}
+				n1, err1 := c2.Write(buf[0:n])
+				if err1 != nil || n1 != n {
+					t.Fatalf("proxy c2.Write: %v\n", err1)
+				}
+			}
+
+			c1.Close()
+			c2.Close()
+		}
+	}()
+}
+
+
+
+func TestPartition2(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	tag := "part2"
+	vshost := port(tag+"v", 1)
+	vs := viewservice.StartServer(vshost)
+	time.Sleep(time.Second)
+	vck := viewservice.MakeClerk("", vshost)
+
+	ck1 := MakeClerk(vshost, "")
+
+	vshosta := vshost + "a"
+	os.Link(vshost, vshosta)
+
+	s1 := StartServer(vshosta, port(tag, 1))
+	delay := int32(0)
+	proxy(t, port(tag, 1), &delay)
+
+	fmt.Printf("Test: Partitioned old primary does not complete Gets ...\n")
+
+	deadtime := viewservice.PingInterval * viewservice.DeadPings
+	time.Sleep(deadtime * 2)
+	if vck.Primary() != s1.me {
+		t.Fatal("primary never formed initial view")
+	}
+
+	s2 := StartServer(vshost, port(tag, 2))
+	time.Sleep(deadtime * 2)
+	v1, _ := vck.Get()
+	if v1.Primary != s1.me || v1.Backup != s2.me {
+		t.Fatal("backup did not join view")
+	}
+
+	ck1.Put("a", "1")
+	check(ck1, "a", "1")
+
+	os.Remove(vshosta)
+
+	// start a client Get(), but use proxy to delay it long
+	// enough that it won't reach s1 until after s1 is no
+	// longer the primary.
+	atomic.StoreInt32(&delay, 5)
+	stale_get := make(chan bool)
+	go func() {
+		local_stale := false
+		defer func() { stale_get <- local_stale }()
+		x := ck1.Get("a")
+		if x == "1" {
+			local_stale = true
+		}
+	}()
+
+	// now s1 cannot talk to viewserver, so view will change.
+
+	for iter := 0; iter < viewservice.DeadPings*3; iter++ {
+		if vck.Primary() == s2.me {
+			break
+		}
+		time.Sleep(viewservice.PingInterval)
+	}
+	if vck.Primary() != s2.me {
+		t.Fatalf("primary never changed")
+	}
+
+	s3 := StartServer(vshost, port(tag, 3))
+	for iter := 0; iter < viewservice.DeadPings*3; iter++ {
+		v, _ := vck.Get()
+		if v.Backup == s3.me && v.Primary == s2.me {
+			break
+		}
+		time.Sleep(viewservice.PingInterval)
+	}
+	v2, _ := vck.Get()
+	if v2.Primary != s2.me || v2.Backup != s3.me {
+		t.Fatalf("new backup never joined")
+	}
+	time.Sleep(2 * time.Second)
+
+	ck2 := MakeClerk(vshost, "")
+	ck2.Put("a", "2")
+	check(ck2, "a", "2")
+
+	s2.kill()
+
+	// wait for delayed get to s1 to complete.
+	select {
+	case x := <-stale_get:
+		if x {
+			t.Fatalf("partitioned primary replied to a Get with a stale value")
+		}
+	case <-time.After(6 * time.Second):
+	}
+
+	check(ck2, "a", "2")
+
+	fmt.Printf("  ... Passed\n")
+
+	s1.kill()
+	s2.kill()
+	s3.kill()
+	vs.Kill()
+}
+

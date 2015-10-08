@@ -13,9 +13,9 @@ import "syscall"
 import "math/rand"
 
 const Debug = 0
-func debug_printf(format string, a ...interface{}) {
+func DPrintf(format string, a ...interface{}) {
 	if Debug > 0 {
-		log.Printf(format, a...)
+		fmt.Printf(format, a...)
 	}
 }
 
@@ -36,45 +36,30 @@ type PBServer struct {
 	replies    map[int64]interface{}
 }
 
-func (pb *PBServer) get_view() bool {
-	v, ok := pb.vs.Get()
-	if ok {
-		pb.view = &v
-		return true
+func (pb *PBServer) isInitialized() bool {
+	return pb.init
+}
+
+func (pb *PBServer) InitState(args *InitStateArgs, reply *InitStateReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	if !pb.isInitialized() {
+		pb.init = true
+		pb.kvstore = args.State
 	}
-	return false
+
+	reply.Err = OK
+	return nil
 }
 
-func (pb *PBServer) get_viewno() uint {
-	return pb.view.Viewnum
-}
-
-func (pb *PBServer) get_primary() string {
-	return pb.view.Primary
-}
-
-func (pb *PBServer) get_backup() string {
-	return pb.view.Backup
-}
-
-func (pb *PBServer) init_backup() bool {
-	args := &InitKvsArgs{pb.kvstore}
-	var reply InitKvsReply
-	call(pb.get_backup(), "PBServer.InitKvs", args, &reply)
-	if reply.Err == OK {
-		return true
-	}
-	return false
-}
-
-
-func (pb *PBServer) filter_duplicate(opid int64, method string, preply interface{}) bool {
+func (pb *PBServer) filterDuplicate(opid int64, method string, preply interface{}) bool {
 	_, ok := pb.filters[opid]
 	if !ok {
 		return false
 	}
 	
-	debug_printf("duplicate op detected, opid : %v, op : %s\n", opid, method)
+	DPrintf("duplicate op detected, opid : %v, op : %s\n", opid, method)
 	rp, ok2 := pb.replies[opid]
 	if !ok2 {
 		return false
@@ -86,7 +71,7 @@ func (pb *PBServer) filter_duplicate(opid int64, method string, preply interface
 		saved, ok2 := rp.(*GetReply) 
 		if ok1 && ok2 {
 			reply := *rpptr
-			copy_GetReply(reply, saved)
+			copyGetReply(reply, saved)
 			return true
 		}
 	} else if method == Put || method == Append {
@@ -94,72 +79,20 @@ func (pb *PBServer) filter_duplicate(opid int64, method string, preply interface
 		saved, ok2 := rp.(*PutAppendReply)
 		if ok1 && ok2 {
 			reply := *rpptr
-			copy_PutAppendReply(reply, saved)
+			copyPutAppendReply(reply, saved)
 			return true
 		}
 	}
 	return false
 }
 
-func (pb *PBServer) record_operation(opid int64, reply interface{}) {
+func (pb *PBServer) recordOperation(opid int64, reply interface{}) {
 	pb.filters[opid] = FilterLife
 	pb.replies[opid] = reply
 }
 
-func (pb *PBServer) backup_put(key string, value string) {
-/*	if pb.get_backup() == "" {
-		return
-	}
-	args := &PutAppendArgs{}
-	args.Key, args.Value = key, value
-	args.Viewnum = pb.get_viewno()
-	args.OpID = nrand()
-	args.Client = pb.me
-	var reply PutAppendReply
-	call(pb.get_backup(), "PBServer.PutAppend", args, &reply)
-*/
-}
-
-func (pb *PBServer) aux_kvs_op(client string, viewno uint, op string) (errx Err, cont bool) {
-	debug_printf("- RPC %s : viewno %d, client %s, server %s\n", op, viewno, client, pb.me);
-	cont = true
-	if client != "" && client == pb.get_backup() {
-		if viewno < pb.get_viewno() { // if the client(pbserver) has a wrong view
-			errx = ErrWrongServer
-			cont = false
-		} else { // we have a wrong view
-			if !pb.get_view() {
-				// fatal error
-			}
-		}
-	} else if (client == pb.get_primary()) {
-		if !pb.init {
-			debug_printf("uninitialized backup : %s\n", pb.me)
-			errx = ErrUninitServer
-			cont = false
-		}
-	}
-	return
-}
-
-func (pb *PBServer) InitKvs(args *InitKvsArgs, reply *InitKvsReply) error {
-	pb.mu.Lock()
-	defer pb.mu.Unlock()
-	
-	debug_printf("- RPC InitKvs, server %s\n", pb.me)
-	
-	if pb.init {
-		debug_printf("duplicated backup init operation detected")
-		return nil
-	}
-	
-	pb.kvstore = args.Kvstore
-	pb.init = true
-	reply.Err = OK
-	return nil
-}
-
-func (pb *PBServer) do_get(args *GetArgs, reply *GetReply) error {
+func (pb *PBServer) doGet(args *GetArgs, reply *GetReply) error {
+	DPrintf("--- op : %s, key : %s", Get, args.Key)
 	key := args.Key
 	value, ok := pb.kvstore[key]
 	if ok {
@@ -171,58 +104,103 @@ func (pb *PBServer) do_get(args *GetArgs, reply *GetReply) error {
 	return nil
 }
 
+/*
+func (pb *PBServer) handler(client string, 
+	rpcname string, args interface{}, reply interface{}) {
+}
+*/
+
+func (pb *PBServer) isRequestFromBackup(client string) bool {
+	if client != "" && client == pb.view.Backup {
+		for {
+			view := pb.pingViewServer()
+			if view != nil {
+				pb.view = view
+				if client == pb.view.Backup {
+					return true
+				}
+				break
+			}
+			time.Sleep(viewservice.PingInterval)
+		}
+	}
+	return false
+}
+
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
-
-	ok := pb.filter_duplicate(args.OpID, Get, &reply)
+	DPrintf("RPC : Get : server %s\n", pb.me)
+	
+	// the client (not a PBServer) thinks we are primary
+	if pb.me != pb.view.Primary {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+	
+	ok := pb.filterDuplicate(args.OpID, Get, &reply)
 	if ok {
-		debug_printf("Duplicate : reply.Err : %s\n", reply.Err)
+		DPrintf("Duplicate : reply.Err : %s\n", reply.Err)
 		return nil
 	}
 
-	client, vnc := args.Client, args.Viewnum
-	errx, cont := pb.aux_kvs_op(client, vnc, "Get")
-	if !cont {
-		reply.Err = errx
-		return nil
-	}
-
-	// if we are primary, forward the request to backup
-	if pb.me == pb.get_primary() && pb.get_backup() != "" {
-		debug_printf("forward the request to backup %s\n", pb.get_backup());
-		
-		args.Client, args.Viewnum = pb.me, pb.get_viewno()
-		call(pb.get_backup(), "PBServer.Get", args, reply)
-		
-		// if we have a wrong view, then get view from the ViewServer 
-		if reply.Err == ErrWrongServer { 
-			if !pb.get_view() {
-				// fatal error
+	// we think we are primary, forward the request to backup
+	if pb.view.Backup != "" {
+		DPrintf("forward %s to backup %s\n", Get, pb.view.Backup);
+	
+		ok := call(pb.view.Backup, "PBServer.BackupGet", args, reply)
+		if ok {
+			if reply.Err == ErrUninitServer {
+				pb.transferState(pb.view.Backup)
+			} else {
+				return nil
 			}
+			// data on backup is more trusted than primary
+		} else {
+			reply.Err = ErrWrongServer 
 			return nil
-		} 
-		if reply.Err == ErrUninitServer {
-			pb.init_backup()
 		}
 	}
 
-	var myreply GetReply
-	pb.do_get(args, &myreply)
-	if !comp_GetReply(reply, &myreply) {
-		if (myreply.Err == OK) {
-			pb.backup_put(args.Key, myreply.Value)
-		}
-		copy_GetReply(reply, &myreply)
-	}
+	pb.doGet(args, reply)
 
-	pb.record_operation(args.OpID, reply)
+	pb.recordOperation(args.OpID, reply)
 
 	return nil
 }
 
-func (pb *PBServer) do_putappend(args *PutAppendArgs, reply *PutAppendReply) error {
-	debug_printf("--- op : %s, key : %s, value : %s\n", args.Method, args.Key, args.Value)
+func (pb *PBServer) BackupGet(args *GetArgs, reply *GetReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	DPrintf("RPC : BackupGet : server %s\n", pb.me)
+	
+	if pb.me != pb.view.Backup {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+	
+	// the request is from primary and we are backup
+
+	if !pb.isInitialized() {
+		reply.Err = ErrUninitServer
+		return nil
+	}
+
+	ok := pb.filterDuplicate(args.OpID, Get, &reply)
+	if ok {
+		DPrintf("Duplicate : reply.Err : %s\n", reply.Err)
+		return nil
+	}
+
+	pb.doGet(args, reply)
+
+	pb.recordOperation(args.OpID, reply)
+
+	return nil
+}
+
+func (pb *PBServer) doPutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+	DPrintf("--- op : %s, key : %s, value : %s\n", args.Method, args.Key, args.Value)
 	
 	key, value := args.Key, args.Value
 	method := args.Method
@@ -239,60 +217,118 @@ func (pb *PBServer) do_putappend(args *PutAppendArgs, reply *PutAppendReply) err
 func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
+	DPrintf("RPC : PutAppend : server %s\n", pb.me)
+	
+	if pb.me != pb.view.Primary {
+		reply.Err = ErrWrongServer
+		return nil
+	}
 
-	ok := pb.filter_duplicate(args.OpID, args.Method, &reply)
+	ok := pb.filterDuplicate(args.OpID, args.Method, &reply)
 	if ok {
-		debug_printf("Duplicate : reply.Err : %s\n", reply.Err)
+		DPrintf("Duplicate : reply.Err : %s\n", reply.Err)
 		return nil
 	}
 
-	errx, cont := pb.aux_kvs_op(args.Client, args.Viewnum, args.Method)
-	if !cont {
-		reply.Err = errx
-		return nil
-	}
-
-	// if we are primary, forward the request to backup
-	if pb.me == pb.get_primary() && pb.get_backup() != "" {
-		debug_printf("forward the request to backup %s\n", pb.get_backup());
+	xferafter :=  false
+	if pb.view.Backup != "" {
+		DPrintf("forward %s to backup %s\n", args.Method, pb.view.Backup);
 		
-		args.Client, args.Viewnum = pb.me, pb.get_viewno()
-		call(pb.get_backup(), "PBServer.PutAppend", args, reply)
-		
-		// if we have a wrong view, then get view from the ViewServer 
-		if reply.Err == ErrWrongServer {
-			if !pb.get_view() {
-				// fatal error
+		tries := 10
+		for tries > 0 {
+			ok := call(pb.view.Backup, "PBServer.BackupPutAppend", args, reply)
+			if ok {
+				if reply.Err == ErrWrongServer {
+					return nil
+				} 
+				if reply.Err == ErrUninitServer {
+					xferafter = true
+				} 
+				break
 			}
-			return nil
+			DPrintf("retry RPC BackupPutAppend %d ...\n", tries)
+			tries--
 		} 
-		if reply.Err == ErrUninitServer {
-			pb.do_putappend(args, reply)
-			pb.init_backup()
+		if tries == 0 {
+			reply.Err = ErrWrongServer
 			return nil
-		} 
+		}
 	} 
 
-	pb.do_putappend(args, reply)
+	pb.doPutAppend(args, reply)
+	pb.recordOperation(args.OpID, reply)
 
-	pb.record_operation(args.OpID, reply)
+	if xferafter {
+		pb.transferState(pb.view.Backup)
+	}
 
 	return nil
 }
 
+func (pb *PBServer) BackupPutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	DPrintf("RPC : BackupPutAppend : server %s\n", pb.me)
+	
+	if pb.me != pb.view.Backup {
+		reply.Err = ErrWrongServer
+		return nil
+	}
 
-func (pb *PBServer) ping_viewserver() {
+	if !pb.isInitialized() {
+		reply.Err = ErrUninitServer
+		return nil
+	}
+
+	ok := pb.filterDuplicate(args.OpID, args.Method, &reply)
+	if ok {
+		DPrintf("Duplicate : reply.Err : %s\n", reply.Err)
+		return nil
+	}
+
+	pb.doPutAppend(args, reply)
+	pb.recordOperation(args.OpID, reply)
+
+	return nil
+}
+
+func (pb *PBServer) transferState(target string) bool {
+	if target != pb.view.Backup {
+		return false
+	}
+	
+	args := &InitStateArgs{pb.kvstore}
+	var reply InitStateReply
+	call(target, "PBServer.InitState", args, &reply)
+	if reply.Err == OK {
+		return true
+	}
+	return false
+}
+
+func (pb *PBServer) TransferState(
+	args *TransferStateArgs, reply *TransferStateReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	pb.transferState(args.Target)
+
+	return nil
+}
+
+func (pb *PBServer) pingViewServer() *viewservice.View {
 	viewno := uint(0)
 	if pb.view != nil {
 		viewno = pb.view.Viewnum
 	}
 	v, e := pb.vs.Ping(viewno)
 	if e == nil {
-		pb.view = &v
+		return &v
 	}
+	return nil
 }
 
-func (pb *PBServer) clean_filters() {
+func (pb *PBServer) cleanUpFilters() {
 	for op := range pb.filters {
 		if pb.filters[op] <= 0 {
 			delete(pb.filters, op)
@@ -301,6 +337,13 @@ func (pb *PBServer) clean_filters() {
 			pb.filters[op]--
 		}
 	}
+}
+
+func (pb *PBServer) requestState(server string) {
+	args := &TransferStateArgs{}
+	args.Target = pb.me
+	var reply TransferStateReply
+	go call(server, "PBServer.TransferState", args, &reply)
 }
 
 //
@@ -312,9 +355,21 @@ func (pb *PBServer) clean_filters() {
 func (pb *PBServer) tick() {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
-	
-	pb.ping_viewserver()
-	pb.clean_filters()
+
+	view := pb.pingViewServer()
+	if view != nil {
+		if !pb.init {
+			if pb.me == view.Primary {
+				// fatal error
+				// pb.kill()
+			} else if pb.me == view.Backup {
+				pb.requestState(view.Primary)
+			}
+		} 
+		pb.view = view
+	}
+
+	pb.cleanUpFilters()
 }
 
 // tell the server to shut itself down.

@@ -1,0 +1,172 @@
+package pbservice
+
+import "viewservice"
+import "fmt"
+//import "io"
+//import "net"
+import "testing"
+import "time"
+import "log"
+import "runtime"
+import "math/rand"
+import "os"
+import "sync"
+import "strconv"
+import "strings"
+import "sync/atomic"
+
+func check(ck *Clerk, key string, value string) {
+	v := ck.Get(key)
+	if v != value {
+		log.Fatalf("Get(%v) -> %v, expected %v", key, v, value)
+	}
+}
+
+func port(tag string, host int) string {
+	s := "/var/tmp/824-"
+	s += strconv.Itoa(os.Getuid()) + "/"
+	os.Mkdir(s, 0777)
+	s += "pb-"
+	s += strconv.Itoa(os.Getpid()) + "-"
+	s += tag + "-"
+	s += strconv.Itoa(host)
+	return s
+}
+
+// check that all known appends are present in a value,
+// and are in order for each concurrent client.
+func checkAppends(t *testing.T, v string, counts []int) {
+	nclients := len(counts)
+	for i := 0; i < nclients; i++ {
+		lastoff := -1
+		for j := 0; j < counts[i]; j++ {
+			wanted := "x " + strconv.Itoa(i) + " " + strconv.Itoa(j) + " y"
+			off := strings.Index(v, wanted)
+			if off < 0 {
+				t.Fatalf("missing element in Append result")
+			}
+			off1 := strings.LastIndex(v, wanted)
+			if off1 != off {
+				t.Fatalf("duplicate element in Append result")
+			}
+			if off <= lastoff {
+				t.Fatalf("wrong order for element in Append result")
+			}
+			lastoff = off
+		}
+	}
+}
+
+func TestRepeatedCrashUnreliable(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	tag := "rcu"
+	vshost := port(tag+"v", 1)
+	vs := viewservice.StartServer(vshost)
+	time.Sleep(time.Second)
+	vck := viewservice.MakeClerk("", vshost)
+
+	fmt.Printf("Test: Repeated failures/restarts with concurrent updates to same key; unreliable ...\n")
+
+	const nservers = 3
+	var sa [nservers]*PBServer
+	samu := sync.Mutex{}
+	for i := 0; i < nservers; i++ {
+		sa[i] = StartServer(vshost, port(tag, i+1))
+		sa[i].setunreliable(true)
+	}
+
+	for i := 0; i < viewservice.DeadPings; i++ {
+		v, _ := vck.Get()
+		if v.Primary != "" && v.Backup != "" {
+			break
+		}
+		time.Sleep(viewservice.PingInterval)
+	}
+
+	// wait a bit for primary to initialize backup
+	time.Sleep(viewservice.DeadPings * viewservice.PingInterval)
+
+	done := int32(0)
+
+	go func() {
+		// kill and restart servers
+		rr := rand.New(rand.NewSource(int64(os.Getpid())))
+		for atomic.LoadInt32(&done) == 0 {
+			i := rr.Int() % nservers
+			// fmt.Printf("%v killing %v\n", ts(), 5001+i)
+			sa[i].kill()
+
+			// wait long enough for new view to form, backup to be initialized
+			time.Sleep(2 * viewservice.PingInterval * viewservice.DeadPings)
+
+			sss := StartServer(vshost, port(tag, i+1))
+			samu.Lock()
+			sa[i] = sss
+			samu.Unlock()
+
+			// wait long enough for new view to form, backup to be initialized
+			time.Sleep(2 * viewservice.PingInterval * viewservice.DeadPings)
+
+		}
+	}()
+
+	// concurrent client thread.
+	ff := func(i int, ch chan int) {
+		ret := -1
+		defer func() { ch <- ret }()
+		ck := MakeClerk(vshost, "")
+		n := 0
+		for atomic.LoadInt32(&done) == 0 {
+			v := "x " + strconv.Itoa(i) + " " + strconv.Itoa(n) + " y"
+			ck.Append("0", v)
+			// if no sleep here, then server tick() threads do not get
+			// enough time to Ping the viewserver.
+			time.Sleep(10 * time.Millisecond)
+			n++
+		}
+		ret = n
+	}
+
+	const nth = 2
+	var cha [nth]chan int
+	for i := 0; i < nth; i++ {
+		cha[i] = make(chan int)
+		go ff(i, cha[i])
+	}
+
+	time.Sleep(20 * time.Second)
+	atomic.StoreInt32(&done, 1)
+
+	fmt.Printf("  ... Appends done ... \n")
+
+	counts := []int{}
+	for i := 0; i < nth; i++ {
+		n := <-cha[i]
+		if n < 0 {
+			t.Fatal("child failed")
+		}
+		counts = append(counts, n)
+	}
+
+	ck := MakeClerk(vshost, "")
+	
+	checkAppends(t, ck.Get("0"), counts)
+
+	ck.Put("aaa", "bbb")
+	if v := ck.Get("aaa"); v != "bbb" {
+		t.Fatalf("final Put/Get failed")
+	}
+
+	fmt.Printf("  ... Passed\n")
+
+	for i := 0; i < nservers; i++ {
+		samu.Lock()
+		sa[i].kill()
+		samu.Unlock()
+	}
+	time.Sleep(time.Second)
+	vs.Kill()
+	time.Sleep(time.Second)
+}
+

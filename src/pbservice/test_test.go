@@ -33,6 +33,7 @@ func port(tag string, host int) string {
 	return s
 }
 
+
 func TestBasicFail(t *testing.T) {
 	runtime.GOMAXPROCS(4)
 
@@ -1141,3 +1142,4 @@ func TestPartition2(t *testing.T) {
 	s3.kill()
 	vs.Kill()
 }
+

@@ -51,29 +51,40 @@ type GetReply struct {
 
 // Your RPC definitions here.
 
-type InitKvsArgs struct {
-	Kvstore map[string]string
+type Reply interface {
+	GetErr() Err
+	SetErr(err Err)
 }
 
-type InitKvsReply struct {
+func (rp *GetReply) GetErr() Err {
+	return rp.Err
+}
+
+func (rp *GetReply) SetErr(err Err) {
+	rp.Err = err
+}
+
+type InitStateArgs struct {
+	State map[string]string
+}
+
+type InitStateReply struct {
 	Err   Err
 }
 
+type TransferStateArgs struct {
+	Target string
+}
+
+type TransferStateReply struct {
+}
 
 // Utility funcs
-func copy_GetReply(dst *GetReply, src *GetReply) {
+func copyGetReply(dst *GetReply, src *GetReply) {
 	dst.Err = src.Err
 	dst.Value = src.Value
 }
 
-func copy_PutAppendReply(dst *PutAppendReply, src *PutAppendReply) {
+func copyPutAppendReply(dst *PutAppendReply, src *PutAppendReply) {
 	dst.Err = src.Err
-}
-
-func comp_GetReply(r1 *GetReply, r2 *GetReply) bool {
-	return r1.Value == r2.Value
-}
-
-func comp_PutAppendReply(r1 *PutAppendReply, r2 *PutAppendReply) bool {
-	return r1.Err == r2.Err
 }
