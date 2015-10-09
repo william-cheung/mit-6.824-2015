@@ -9,6 +9,7 @@ import "fmt"
 import "os"
 import "sync/atomic"
 
+// for debugging
 const Debug = 0
 func DPrintf(format string, a ...interface{}) {
 	if Debug == 1 {
