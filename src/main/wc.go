@@ -4,9 +4,9 @@ import "os"
 import "fmt"
 import "mapreduce"
 import "strings"
+
 import "unicode"
 import "strconv"
-
 import "container/list"
 
 // our simplified version of MapReduce does not supply a
