@@ -69,7 +69,7 @@ func call(srv string, rpcname string,
 	return false
 }
 
-func (ck *Clerk) get_view(userpc bool) *viewservice.View {
+func (ck *Clerk) getView(userpc bool) *viewservice.View {
 	if ck.view == nil || userpc {
 		v, ok := ck.vs.Get() 
 		if ok { 
@@ -79,17 +79,10 @@ func (ck *Clerk) get_view(userpc bool) *viewservice.View {
 	return ck.view
 }
 
-func (ck *Clerk) get_primary(userpc bool) string {
-	v := ck.get_view(userpc)
+func (ck *Clerk) getPrimary(userpc bool) string {
+	v := ck.getView(userpc)
 	if v != nil { return v.Primary }
 	return ""
-}
-
-func (ck *Clerk) get_viewno() uint {
-	if ck.get_view(false) != nil {
-		return ck.view.Viewnum
-	} 
-	return 0
 }
 
 //
@@ -100,22 +93,16 @@ func (ck *Clerk) get_viewno() uint {
 // says the key doesn't exist (has never been Put().
 //
 func (ck *Clerk) Get(key string) string {
-	// Your code here.
-
 	args := &GetArgs{Key:key}
-	args.Client = ck.me
-	args.OpID = nrand()
-	
+	args.OpID = nrand()	
 	var reply GetReply
 	
 	userpc := false
 	for {
 		ck.mu.Lock()
-		primary := ck.get_primary(userpc)
-		viewno  := ck.get_viewno()
+		primary := ck.getPrimary(userpc)
 		ck.mu.Unlock()
 
-		args.Viewnum = viewno
 		call(primary, "PBServer.Get", args, &reply)
 		
 		if reply.Err == OK || reply.Err == ErrNoKey {
@@ -133,22 +120,16 @@ func (ck *Clerk) Get(key string) string {
 // send a Put or Append RPC
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// Your code here.
-	
 	args := &PutAppendArgs{Key:key, Value:value, Method:op}
-	args.Client = ck.me
 	args.OpID = nrand()
-	
 	var reply PutAppendReply
 	
 	userpc := false
 	for {
 		ck.mu.Lock()
-		primary := ck.get_primary(userpc)
-		viewno  := ck.get_viewno()
+		primary := ck.getPrimary(userpc)
 		ck.mu.Unlock()
 
-		args.Viewnum = viewno
 		call(primary, "PBServer.PutAppend", args, &reply)
 		
 		if reply.Err == OK {

@@ -19,7 +19,8 @@ func DPrintf(format string, a ...interface{}) {
 	}
 }
 
-const FilterLife = int(10000 * time.Millisecond / viewservice.PingInterval)    // 10 sec
+// life of a filter : 10 sec
+const FilterLife = int(10000 * time.Millisecond / viewservice.PingInterval)
 
 type PBServer struct {
 	mu         sync.Mutex
@@ -29,11 +30,11 @@ type PBServer struct {
 	me         string
 	vs         *viewservice.Clerk
 	// Your declarations here.
-	init       bool                // initialized
-	view       *viewservice.View
-	kvstore    map[string]string
-	filters    map[int64]int
-	replies    map[int64]interface{}
+	init       bool                   // for initialization
+	view       *viewservice.View      // the view we hold
+	kvstore    map[string]string      // in memory key-value store 
+	filters    map[int64]int          // filters to filter dup-ops
+	replies    map[int64]interface{}  // cached replies to ops
 }
 
 func (pb *PBServer) isInitialized() bool {
@@ -42,18 +43,17 @@ func (pb *PBServer) isInitialized() bool {
 
 func (pb *PBServer) InitState(args *InitStateArgs, reply *InitStateReply) error {
 	pb.mu.Lock()
-	defer pb.mu.Unlock()
-
 	if !pb.isInitialized() {
 		pb.init = true
 		pb.kvstore = args.State
 	}
+	pb.mu.Unlock()
 
 	reply.Err = OK
 	return nil
 }
 
-func (pb *PBServer) filterDuplicate(opid int64, method string, preply interface{}) bool {
+func (pb *PBServer) filterDuplicate(opid int64, method string, reply interface{}) bool {
 	_, ok := pb.filters[opid]
 	if !ok {
 		return false
@@ -65,20 +65,19 @@ func (pb *PBServer) filterDuplicate(opid int64, method string, preply interface{
 		return false
 	}
 
-	// bad design, because there would be many types of operations to be filtered 
+	// bad design, because there would be various 
+	// types of operations to be filtered 
 	if method == Get {
-		rpptr, ok1 := preply.(**GetReply)
+		reply, ok1 := reply.(*GetReply)
 		saved, ok2 := rp.(*GetReply) 
 		if ok1 && ok2 {
-			reply := *rpptr
 			copyGetReply(reply, saved)
 			return true
 		}
 	} else if method == Put || method == Append {
-		rpptr, ok1 := preply.(**PutAppendReply)
+		reply, ok1 := reply.(*PutAppendReply)
 		saved, ok2 := rp.(*PutAppendReply)
 		if ok1 && ok2 {
-			reply := *rpptr
 			copyPutAppendReply(reply, saved)
 			return true
 		}
@@ -92,7 +91,7 @@ func (pb *PBServer) recordOperation(opid int64, reply interface{}) {
 }
 
 func (pb *PBServer) doGet(args *GetArgs, reply *GetReply) error {
-	DPrintf("--- op : %s, key : %s", Get, args.Key)
+	DPrintf("--- op : %s, key : %s\n", Get, args.Key)
 	key := args.Key
 	value, ok := pb.kvstore[key]
 	if ok {
@@ -102,29 +101,6 @@ func (pb *PBServer) doGet(args *GetArgs, reply *GetReply) error {
 		reply.Err = ErrNoKey
 	}
 	return nil
-}
-
-/*
-func (pb *PBServer) handler(client string, 
-	rpcname string, args interface{}, reply interface{}) {
-}
-*/
-
-func (pb *PBServer) isRequestFromBackup(client string) bool {
-	if client != "" && client == pb.view.Backup {
-		for {
-			view := pb.pingViewServer()
-			if view != nil {
-				pb.view = view
-				if client == pb.view.Backup {
-					return true
-				}
-				break
-			}
-			time.Sleep(viewservice.PingInterval)
-		}
-	}
-	return false
 }
 
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
@@ -138,7 +114,7 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 		return nil
 	}
 	
-	ok := pb.filterDuplicate(args.OpID, Get, &reply)
+	ok := pb.filterDuplicate(args.OpID, Get, reply)
 	if ok {
 		DPrintf("Duplicate : reply.Err : %s\n", reply.Err)
 		return nil
@@ -156,7 +132,8 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 				return nil
 			}
 			// data on backup is more trusted than primary
-		} else {
+		} else { 
+			// unreliable backup / backup is down / network partition
 			reply.Err = ErrWrongServer 
 			return nil
 		}
@@ -186,7 +163,7 @@ func (pb *PBServer) BackupGet(args *GetArgs, reply *GetReply) error {
 		return nil
 	}
 
-	ok := pb.filterDuplicate(args.OpID, Get, &reply)
+	ok := pb.filterDuplicate(args.OpID, Get, reply)
 	if ok {
 		DPrintf("Duplicate : reply.Err : %s\n", reply.Err)
 		return nil
@@ -224,7 +201,7 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 		return nil
 	}
 
-	ok := pb.filterDuplicate(args.OpID, args.Method, &reply)
+	ok := pb.filterDuplicate(args.OpID, args.Method, reply)
 	if ok {
 		DPrintf("Duplicate : reply.Err : %s\n", reply.Err)
 		return nil
@@ -234,7 +211,7 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 	if pb.view.Backup != "" {
 		DPrintf("forward %s to backup %s\n", args.Method, pb.view.Backup);
 		
-		tries := 10
+		tries := 1 // tring again doesn't help in many cases
 		for tries > 0 {
 			ok := call(pb.view.Backup, "PBServer.BackupPutAppend", args, reply)
 			if ok {
@@ -280,7 +257,7 @@ func (pb *PBServer) BackupPutAppend(args *PutAppendArgs, reply *PutAppendReply) 
 		return nil
 	}
 
-	ok := pb.filterDuplicate(args.OpID, args.Method, &reply)
+	ok := pb.filterDuplicate(args.OpID, args.Method, reply)
 	if ok {
 		DPrintf("Duplicate : reply.Err : %s\n", reply.Err)
 		return nil
@@ -396,7 +373,6 @@ func (pb *PBServer) setunreliable(what bool) {
 func (pb *PBServer) isunreliable() bool {
 	return atomic.LoadInt32(&pb.unreliable) != 0
 }
-
 
 func StartServer(vshost string, me string) *PBServer {
 	pb := new(PBServer)

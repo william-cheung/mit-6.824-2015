@@ -1,0 +1,36 @@
+
+part1 & part 2 : delivered Get to old primary, should get error ErrWrongAnswer 
+
+a case demonstrates that backup is more trusted than primary
+
+C               S1                S2
+|               |                 |
+|               p                 b
+|               |                 |
+|				|                 |
+|			    vd                |
+|				|                 p
+|				|                 |
+|               |                 |
+|               |                 |
+Put             |                 |  
+|               |                 |
+|               |                 Put
+|               |                 |
+Get1            |                 |
+|               |                 Get1     
+|               |                 | 
+|               |                 |
+|               |                 vd
+|               |                 |
+|               p                 b
+|               |                 |
+|               |                 |    
+Get2            |                 |
+|               Get2              |
+|               |                 Get2
+
+
+p  : Primary    b : Backup
+vd : alive but cannot connect to VS
+

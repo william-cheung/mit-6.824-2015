@@ -21,11 +21,10 @@ const (
 type PutAppendArgs struct {
 	Key   string
 	Value string
+	
 	// You'll have to add definitions here.
-	Client   string
-	Viewnum	 uint
-	Method   string
 	OpID     int64
+	Method   string
 
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
@@ -37,9 +36,8 @@ type PutAppendReply struct {
 
 type GetArgs struct {
 	Key string
+	
 	// You'll have to add definitions here.
-	Client  string
-	Viewnum uint
 	OpID    int64
 }
 
@@ -61,6 +59,14 @@ func (rp *GetReply) GetErr() Err {
 }
 
 func (rp *GetReply) SetErr(err Err) {
+	rp.Err = err
+}
+
+func (rp *PutAppendReply) GetErr() Err {
+	return rp.Err
+}
+
+func (rp *PutAppendReply) SetErr(err Err) {
 	rp.Err = err
 }
 
