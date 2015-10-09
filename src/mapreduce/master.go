@@ -27,7 +27,6 @@ func (mr *MapReduce) KillWorkers() *list.List {
 }
 
 func (mr *MapReduce) RunMaster() *list.List {
-	DPrintf("RunMaster\n")
 	idleWorkerChannel := make(chan string)
 	jobChannel := make(chan *DoJobArgs)
 	doneChannel := make(chan int)
