@@ -29,6 +29,7 @@ type PBServer struct {
 	unreliable int32 // for testing
 	me         string
 	vs         *viewservice.Clerk
+	
 	// Your declarations here.
 	init       bool                   // for initialization
 	view       *viewservice.View      // the view we hold
