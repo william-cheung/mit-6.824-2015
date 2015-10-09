@@ -49,6 +49,7 @@ type GetReply struct {
 
 // Your RPC definitions here.
 
+/*
 type Reply interface {
 	GetErr() Err
 	SetErr(err Err)
@@ -69,6 +70,7 @@ func (rp *PutAppendReply) GetErr() Err {
 func (rp *PutAppendReply) SetErr(err Err) {
 	rp.Err = err
 }
+*/
 
 type InitStateArgs struct {
 	State map[string]string
