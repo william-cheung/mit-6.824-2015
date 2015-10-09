@@ -92,6 +92,7 @@ func (pb *PBServer) recordOperation(opid int64, reply interface{}) {
 
 func (pb *PBServer) doGet(args *GetArgs, reply *GetReply) error {
 	DPrintf("--- op : %s, key : %s\n", Get, args.Key)
+	
 	key := args.Key
 	value, ok := pb.kvstore[key]
 	if ok {
