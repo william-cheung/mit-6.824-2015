@@ -15,6 +15,8 @@ import "strconv"
 import "strings"
 import "sync/atomic"
 
+// Utilities
+
 func check(ck *Clerk, key string, value string) {
 	v := ck.Get(key)
 	if v != value {
@@ -33,6 +35,8 @@ func port(tag string, host int) string {
 	return s
 }
 
+
+// Tests
 
 func TestBasicFail(t *testing.T) {
 	runtime.GOMAXPROCS(4)

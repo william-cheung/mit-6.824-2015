@@ -66,8 +66,8 @@ func (pb *PBServer) filterDuplicate(opid int64, method string, reply interface{}
 		return false
 	}
 
-	// bad design, because there would be various 
-	// types of operations to be filtered 
+	// bad design, because there would be various types 
+	// of operations to be filtered 
 	if method == Get {
 		reply, ok1 := reply.(*GetReply)
 		saved, ok2 := rp.(*GetReply) 
