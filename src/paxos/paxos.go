@@ -53,46 +53,18 @@ type Paxos struct {
 	peers      []string
 	me         int // index into peers[]
 
-
 	// Your data here.
+	status     map[int]Fate          // status of each instance
+	values     map[int]interface{}   // decided value of each instance	
+
+	accpState   map[int]State         // acceptor state of each instance
 }
 
-//
-// call() sends an RPC to the rpcname handler on server srv
-// with arguments args, waits for the reply, and leaves the
-// reply in reply. the reply argument should be a pointer
-// to a reply structure.
-//
-// the return value is true if the server responded, and false
-// if call() was not able to contact the server. in particular,
-// the replys contents are only valid if call() returned true.
-//
-// you should assume that call() will time out and return an
-// error after a while if it does not get a reply from the server.
-//
-// please use call() to send all RPCs, in client.go and server.go.
-// please do not change this function.
-//
-func call(srv string, name string, args interface{}, reply interface{}) bool {
-	c, err := rpc.Dial("unix", srv)
-	if err != nil {
-		err1 := err.(*net.OpError)
-		if err1.Err != syscall.ENOENT && err1.Err != syscall.ECONNREFUSED {
-			fmt.Printf("paxos Dial() failed: %v\n", err1)
-		}
-		return false
-	}
-	defer c.Close()
-
-	err = c.Call(name, args, reply)
-	if err == nil {
-		return true
-	}
-
-	fmt.Println(err)
-	return false
+type State struct {
+	prepProposal int
+	accpProposal int
+	accpValue    interface{}
 }
-
 
 //
 // the application wants paxos to start agreement on
@@ -102,7 +74,143 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 // is reached.
 //
 func (px *Paxos) Start(seq int, v interface{}) {
-	// Your code here.
+	if seq < px.Min() { return }
+	go propose(seq, v)
+}
+
+func (px *Paxos) propose(seq int, v interface{}) {
+	_, fate := px.Status(seq) 
+	while fate != Decided {
+		n := px.chooseProposalNumber(seq)
+		v1, ok := px.sendPrepareToAll(seq, n, v)
+		if !ok {
+			continue
+		}
+		ok = px.sendAcceptToAll(seq, n, v1)
+		if ok {
+			px.sendDecidedToAll(seq, v1)
+			break;
+		}
+	}
+}
+
+func (px *Paxos) chooseProposalNumber(seq int) int {
+	n := px.accpState[seq].prepProposal
+	return n + 1
+}
+
+func (px *Paxos) sendPrepareToAll(seq int, 
+	n int, v interface{}) (interface{}, bool) {
+	cntok, maxna := 0
+	var v1 interface{}
+	for _, peer := range px.peers {
+		na, va, ok := px.prepare(peer, seq, n)
+		if ok {
+			if na > maxna {
+				v1 = va
+			}
+			cntok++
+		}
+	}
+	if cntok > (len(px.peers) + 1) / 2 {
+		if maxna == 0 {
+			v1 = v
+		}
+		return v1, true
+	}
+	return nil, false
+}
+
+func (px *Paxos) prepare(peer string, seq int, n int) 
+	(int, interface{}, bool) {
+	if peer == px.me {
+		return px.prepareHandler(seq, n)
+	} else {
+		args := &PrepareArgs{seq, n}
+		var reply PrepareReply
+		ok := call(peer, "Paxos.Prepare", args, &reply)
+		if !ok || reply.Err != OK {
+			return 0, nil, false
+		}
+		return reply.Proposal, reply.Value, true
+	}
+}
+
+func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
+	n, v, ok := px.prepareHandler(args.Instance, args.Proposal)
+	if ok {
+		reply.Err = OK
+		reply.Proposal, reply.Value = n, v
+	} else {
+		reply.Err = ErrRejected
+	}
+	return nil
+}
+
+func (px &Paxos) prepareHandler(seq int, n int) (int, interface{}, bool) {
+	state := &px.accpState[seq]
+	if n > state.prepProposal {
+		state.prepProposal = n
+		n, v := state.accpProposal, state.accpValue
+		return n, v, true
+	} else {
+		return 0, nil, false
+	}
+}
+
+func (px *Paxos) sendAcceptToAll(seq int, n int, v interface{}) bool {
+	cntok := 0
+	for _, peer := range px.peers {
+		ok := px.accept(peer, seq, n, v)
+		if ok {
+			cntok++
+		}
+	}
+	if cntok > (len(px.peers) + 1) / 2 {
+		return true
+	}
+	return false
+}
+
+func (px *Paxos) accept(peer string, seq int, n int, v interface{}) bool {
+	if peer == px.me {
+		return px.acceptHandler(seq, n, v)
+	} else {
+		args := AcceptArgs{seq, n, v}
+		var reply AcceptReply
+		ok := call(peer, "Paxos.Accept", args, &reply)
+		if !ok || reply.Err != OK {
+			return false
+		}
+		return true
+	}
+}
+
+func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
+	ok := px.accpetHandler(args.Instance, args.Proposal, args.Value)
+	if ok {
+		reply.Err = OK
+	} else {
+		reply.Err = ErrRejected
+	}
+	return nil
+}
+
+func (px *Paxos) acceptHandler(seq int, n int, v interface{}) bool {
+	state := &px.accpState[seq]
+	if n >= state.prepProposal {
+		state.prepProposal = n
+		state.accpProposal = n
+		state.accpValue = v
+		return true
+	} 
+	return false
+}
+
+func (px *Paxos) sendDecidedToAll(seq int, v interface{}) {
+	for _, peer := range px.peers {
+		//px.decided(peer, seq, v)
+	}
 }
 
 //
