@@ -8,7 +8,6 @@ type WorkerInfo struct {
 	// You can add definitions here.
 }
 
-
 // Clean up all workers by sending a Shutdown RPC to each one of them Collect
 // the number of jobs each work has performed.
 func (mr *MapReduce) KillWorkers() *list.List {
