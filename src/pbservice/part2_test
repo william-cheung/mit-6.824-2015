@@ -8,11 +8,8 @@ import "testing"
 import "time"
 import "log"
 import "runtime"
-//import "math/rand"
 import "os"
-//import "sync"
 import "strconv"
-//import "strings"
 import "sync/atomic"
 
 func check(ck *Clerk, key string, value string) {
