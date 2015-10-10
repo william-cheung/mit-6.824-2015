@@ -3,6 +3,7 @@ package paxos
 import "fmt"
 import "net"
 import "net/rpc"
+import "syscall"
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -41,3 +42,31 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 }
 
 
+const (
+	OK          = "OK"
+	ErrRejected = "ErrRejected"
+)
+
+type Err string
+
+type PrepareArgs struct {
+	Instance int
+	Proposal int
+}
+
+type PrepareReply struct {
+	Err      Err
+	Instance int
+	Proposal int
+	Value    interface{}
+}
+
+type AcceptArgs struct {
+	Instance int
+	Proposal int
+	Value    interface{}
+}
+
+type AcceptReply struct {
+	Err      Err
+}
