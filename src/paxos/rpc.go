@@ -70,3 +70,12 @@ type AcceptArgs struct {
 type AcceptReply struct {
 	Err      Err
 }
+
+type DecidedArgs struct {
+	Instance int
+	Value    interface{}
+}
+
+type DecidedReply struct {
+}
+

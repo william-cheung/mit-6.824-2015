@@ -31,6 +31,13 @@ import "sync/atomic"
 import "fmt"
 import "math/rand"
 
+// for debugging
+const Debug = 1
+func DPrintf(format string, a ...interface{}) {
+	if Debug > 0 {
+		fmt.Printf(format, a...)
+	}
+}
 
 // px.Status() return values, indicating
 // whether an agreement has been decided,
@@ -91,22 +98,28 @@ func (px *Paxos) updateMaxSeqSeen(seq int) {
 	}
 }
 
-func (px *Paxos) propose(seq int, v interface{}) {
-	px.mu.Lock()
-	defer px.mu.Unlock()
-
-	_, decided := px.values[seq] 
-	for !decided {
+func (px *Paxos) isDecided(seq int) bool {
+	decided, _ := px.Status(seq)
+	return decided == Decided
+}
+ 
+func (px *Paxos) propose(seq int, v interface{}) {	
+	for !px.isDecided(seq) {
+		px.mu.Lock()
 		n := px.chooseProposalNumber(seq)
 		v1, ok := px.sendPrepareToAll(seq, n, v)
+		px.mu.Unlock()
 		if !ok {
 			continue
 		}
+		px.mu.Lock()
 		ok = px.sendAcceptToAll(seq, n, v1)
 		if ok {
 			px.sendDecidedToAll(seq, v1)
+			px.mu.Unlock()
 			break;
 		}
+		px.mu.Unlock()
 	}
 }
 
@@ -137,8 +150,12 @@ func (px *Paxos) sendPrepareToAll(seq int,
 	return nil, false
 }
 
+func (px *Paxos) self() string {
+	return px.peers[px.me]
+}
+
 func (px *Paxos) isSelf(peer string) bool {
-	return peer == px.peers[px.me]
+	return peer == px.self()
 }
 
 func (px *Paxos) prepare(peer string, seq int, n int) (int, interface{}, bool) {
@@ -156,6 +173,9 @@ func (px *Paxos) prepare(peer string, seq int, n int) (int, interface{}, bool) {
 }
 
 func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
+	DPrintf("RPC Prepare : inst %d : prop %d : serv %s\n", 
+		args.Instance, args.Proposal, px.self())
+
 	px.mu.Lock()
 	n, v, ok := px.prepareHandler(args.Instance, args.Proposal)
 	px.mu.Unlock()
@@ -210,6 +230,9 @@ func (px *Paxos) accept(peer string, seq int, n int, v interface{}) bool {
 }
 
 func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
+	DPrintf("RPC Accept : inst %d : prop %d : value %v : serv %s\n", 
+		args.Instance, args.Proposal, args.Value, px.self())
+	
 	px.mu.Lock()
 	ok := px.acceptHandler(args.Instance, args.Proposal, args.Value)
 	px.mu.Unlock()
@@ -236,12 +259,33 @@ func (px *Paxos) acceptHandler(seq int, n int, v interface{}) bool {
 
 func (px *Paxos) sendDecidedToAll(seq int, v interface{}) {
 	//px.status[seq] = Decided
-	px.values[seq] = v
-	/*
 	for _, peer := range px.peers {
 		px.decided(peer, seq, v)
 	}
-	*/
+}
+
+func (px *Paxos) decided(peer string, seq int, v interface{}) {
+	if px.isSelf(peer) {
+		px.decidedHandler(seq, v)
+	} else {
+		args := &DecidedArgs{seq, v}
+		var reply DecidedReply
+		go call(peer, "Paxos.Decided", args, &reply)
+	}
+}
+
+func (px *Paxos) Decided(args *DecidedArgs, reply *DecidedReply) error {
+	DPrintf("RPC Decided : inst %d : value %v : serv %s\n", 
+		args.Instance, args.Value, px.self())
+
+	px.mu.Lock()
+	px.decidedHandler(args.Instance, args.Value)
+	px.mu.Unlock()
+	return nil
+}
+
+func (px *Paxos) decidedHandler(seq int, v interface{}) {
+	px.values[seq] = v
 }
 
 //
