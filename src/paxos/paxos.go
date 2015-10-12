@@ -64,16 +64,15 @@ type Paxos struct {
 	done       int                   // any instance seq x <= done is forgotten
 	maxSeqSeen int                   // highest seq known to this peer
 
-	//status     map[int]Fate          // status of each instance
 	values     map[int]interface{}   // decided value of each instance	
 
 	accpState  map[int]State         // acceptor state of each instance
 }
 
-type State struct {
-	prepProposal int
-	accpProposal int
-	accpValue    interface{}
+type State struct {             // acceptor state
+	prepProposal int            // highest prepare seen 
+	accpProposal int            // highest accept seen         				
+	accpValue    interface{}    // value of highest accepted proposal
 }
 
 func (px *Paxos) lock() {
@@ -117,23 +116,30 @@ func (px *Paxos) isDecided(seq int) bool {
 func (px *Paxos) propose(seq int, v interface{}) {	
 	for !px.isDecided(seq) {
 		
+		// choose n, unique and higher than any proposal number seen
 		n := px.chooseProposalNumber(seq)
-
+		
+		// using channels to synchronize and avoid deadlock
 		chan1 := make(chan bool)
 		chan2 := make(chan interface{})
+		
+		// boadcast n to all peers
 		go px.sendPrepareToAll(seq, n, v, chan1, chan2)
 		
+		// if ok is true, we received prepare_ok from majority servers
 		ok := <- chan1
 		if !ok {
 			continue
 		}
-		v1 := <- chan2 
+		v1 := <- chan2 // get the value choosed in the prepare phase
+		
 		
 		chan3 := make(chan bool)
+		// send n, v1 to all peers
 		go px.sendAcceptToAll(seq, n, v1, chan3)
 
 		ok = <- chan3
-		if ok {
+		if ok { // we reach agreement on value v1
 			go px.sendDecidedToAll(seq, v1)
 			break;
 		}
@@ -159,6 +165,12 @@ func (px *Paxos) sendPrepareToAll(seq int,
 				v1 = va
 			}
 			cntok++
+		} else {
+			// update highest proposal number we seen
+			if (px.updateProposalNumber(seq, na)) {
+				chan1 <- false
+				continue
+			}
 		}
 	}
 	if cntok > len(px.peers) / 2 {
@@ -170,6 +182,20 @@ func (px *Paxos) sendPrepareToAll(seq int,
 	}
 	chan1 <- false
 }
+
+func (px *Paxos) updateProposalNumber(seq int, n int) bool {
+	px.lock()
+	defer px.unlock()
+	
+	state := px.accpState[seq]
+	if (n > state.prepProposal) {
+		state.prepProposal = n
+		px.accpState[seq] = state
+		return true
+	}
+	return false
+}
+
 
 func (px *Paxos) self() string {
 	return px.peers[px.me]
@@ -186,8 +212,10 @@ func (px *Paxos) prepare(peer string, seq int, n int) (int, interface{}, bool) {
 		args := &PrepareArgs{seq, n}
 		var reply PrepareReply
 		ok := call(peer, "Paxos.Prepare", args, &reply)
-		if !ok || reply.Err != OK {
+		if !ok {
 			return 0, nil, false
+		} else if reply.Err != OK { 
+			return reply.Proposal, nil, false
 		}
 		return reply.Proposal, reply.Value, true
 	}
@@ -202,6 +230,7 @@ func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 		reply.Proposal, reply.Value = n, v
 	} else {
 		reply.Err = ErrRejected
+		reply.Proposal = n // reply the highest proposal number we seen to the client
 	}
 	return nil
 }
@@ -217,7 +246,7 @@ func (px *Paxos) prepareHandler(seq int, n int) (int, interface{}, bool) {
 		px.accpState[seq] = state
 		return n, v, true
 	} else {
-		return 0, nil, false
+		return state.prepProposal, nil, false
 	}
 }
 
@@ -455,7 +484,6 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.done = -1
 	px.maxSeqSeen = -1
 	
-	//px.status = make(map[int]Fate)
 	px.values = make(map[int]interface{})
 	px.accpState = make(map[int]State)
 
