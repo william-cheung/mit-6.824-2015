@@ -31,6 +31,8 @@ import "sync/atomic"
 import "fmt"
 import "math/rand"
 
+//import "runtime" 
+
 // for debugging
 const Debug = 0
 func DPrintf(format string, a ...interface{}) {
@@ -127,6 +129,8 @@ func (px *Paxos) propose(seq int, v interface{}) {
 		// boadcast n to all peers
 		go px.sendPrepareToAll(seq, n, v, chan1, chan2)
 		
+		//runtime.GC()
+
 		// if ok is true, we received prepare_ok from majority servers
 		ok := <- chan1
 		if !ok {
@@ -155,11 +159,27 @@ func (px *Paxos) chooseProposalNumber(seq int) int {
 
 func (px *Paxos) sendPrepareToAll(seq int, 
 	n int, v interface{}, chan1 chan<- bool, chan2 chan<- interface{}) {
+
+	nchs := len(px.peers)
+	okchs := make([]chan bool, nchs)
+	nachs := make([]chan int, nchs)
+	vachs := make([]chan interface{}, nchs)
+
+	for i, peer := range px.peers {
+		okchs[i] = make(chan bool)
+		nachs[i] = make(chan int)
+		vachs[i] = make(chan interface{})
+
+		go px.prepare(peer, seq, n, okchs[i], nachs[i], vachs[i])
+	}
+
 	cntok, maxna := 0, 0
 	var v1 interface{}
-	for _, peer := range px.peers {
-		na, va, ok := px.prepare(peer, seq, n)
+	for i := 0; i < nchs; i++ {
+		ok := <- okchs[i]
+		na := <- nachs[i]
 		if ok {
+			va := <- vachs[i]
 			if na > maxna {
 				maxna = na
 				v1 = va
@@ -169,19 +189,19 @@ func (px *Paxos) sendPrepareToAll(seq int,
 			// update highest proposal number we seen
 			if (px.updateProposalNumber(seq, na)) {
 				chan1 <- false
-				return
+				break
 			}
 		}
 	}
+
 	if cntok > len(px.peers) / 2 {
 		if maxna == 0 {
 			v1 = v
 		}
 		chan1 <- true 
 		chan2 <- v1
-	} else {
-		chan1 <- false
 	}
+	chan1 <- false
 }
 
 func (px *Paxos) updateProposalNumber(seq int, n int) bool {
@@ -206,19 +226,32 @@ func (px *Paxos) isSelf(peer string) bool {
 	return peer == px.self()
 }
 
-func (px *Paxos) prepare(peer string, seq int, n int) (int, interface{}, bool) {
+func (px *Paxos) prepare(peer string, seq int, n int, 
+	okch chan<- bool, nach chan<- int, vach chan <- interface{}) {
+	
+	var succ bool
+	var prop int
+	var val  interface{}
+
 	if px.isSelf(peer) {
-		return px.prepareHandler(seq, n)
+		prop, val, succ = px.prepareHandler(seq, n)
 	} else {
 		args := &PrepareArgs{seq, n}
 		var reply PrepareReply
 		ok := call(peer, "Paxos.Prepare", args, &reply)
 		if !ok {
-			return 0, nil, false
+			prop, val, succ = 0, nil, false	
 		} else if reply.Err != OK { 
-			return reply.Proposal, nil, false
+			prop, val, succ = reply.Proposal, nil, false
+		} else {
+			prop, val, succ = reply.Proposal, reply.Value, true
 		}
-		return reply.Proposal, reply.Value, true
+	}
+	
+	okch <- succ
+	nach <- prop
+	if succ {
+		vach <- val
 	}
 }
 
@@ -252,9 +285,15 @@ func (px *Paxos) prepareHandler(seq int, n int) (int, interface{}, bool) {
 }
 
 func (px *Paxos) sendAcceptToAll(seq int, n int, v interface{}, okch chan<- bool) {
+	nchs  := len(px.peers)
+	okchs := make([]chan bool, nchs)
+	for i, peer := range px.peers {
+		okchs[i] = make(chan bool)
+		go px.accept(peer, seq, n, v, okchs[i])
+	}
 	cntok := 0
-	for _, peer := range px.peers {
-		ok := px.accept(peer, seq, n, v)
+	for i := 0; i < nchs; i++ {
+		ok := <- okchs[i]
 		if ok {
 			cntok++
 		}
@@ -265,17 +304,18 @@ func (px *Paxos) sendAcceptToAll(seq int, n int, v interface{}, okch chan<- bool
 	okch <- false
 }
 
-func (px *Paxos) accept(peer string, seq int, n int, v interface{}) bool {
+func (px *Paxos) accept(peer string, seq int, n int, v interface{}, okch chan<- bool) {
 	if px.isSelf(peer) {
-		return px.acceptHandler(seq, n, v)
+		okch <- px.acceptHandler(seq, n, v)
 	} else {
 		args := AcceptArgs{seq, n, v}
 		var reply AcceptReply
 		ok := call(peer, "Paxos.Accept", args, &reply)
 		if !ok || reply.Err != OK {
-			return false
+			okch <- false
+		} else {
+			okch <- true
 		}
-		return true
 	}
 }
 
@@ -361,7 +401,6 @@ func (px *Paxos) Done(seq int) {
 }
 
 func (px *Paxos) erase(seq int) {
-	//delete(status, seq)
 	delete(px.values, seq)
 	delete(px.accpState, seq)
 }
