@@ -69,7 +69,8 @@ type Paxos struct {
 	accpState  map[int]State         // acceptor state of each instance
 }
 
-type State struct {             // acceptor state
+// acceptor state
+type State struct { 
 	prepProposal int            // highest prepare seen 
 	accpProposal int            // highest accept seen         				
 	accpValue    interface{}    // value of highest accepted proposal
