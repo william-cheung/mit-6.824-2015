@@ -37,7 +37,7 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
+	//fmt.Println(err)
 	return false
 }
 

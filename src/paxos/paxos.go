@@ -32,7 +32,7 @@ import "fmt"
 import "math/rand"
 
 // for debugging
-const Debug = 1
+const Debug = 0
 func DPrintf(format string, a ...interface{}) {
 	if Debug > 0 {
 		fmt.Printf(format, a...)
@@ -76,6 +76,17 @@ type State struct {
 	accpValue    interface{}
 }
 
+func (px *Paxos) lock() {
+	//DPrintf("try lock %s\n", px.self());
+	px.mu.Lock();
+	//DPrintf("lock %s\n", px.self());
+}
+
+func (px *Paxos) unlock() {
+	//DPrintf("unlock %s\n", px.self());
+	px.mu.Unlock();
+}
+
 //
 // the application wants paxos to start agreement on
 // instance seq, with proposed value v.
@@ -84,8 +95,8 @@ type State struct {
 // is reached.
 //
 func (px *Paxos) Start(seq int, v interface{}) {
-	px.mu.Lock()
-	defer px.mu.Unlock()
+	px.lock()
+	defer px.unlock()
 	
 	if seq <= px.done { return }
 	px.updateMaxSeqSeen(seq)
@@ -105,49 +116,59 @@ func (px *Paxos) isDecided(seq int) bool {
  
 func (px *Paxos) propose(seq int, v interface{}) {	
 	for !px.isDecided(seq) {
-		px.mu.Lock()
+		
 		n := px.chooseProposalNumber(seq)
-		v1, ok := px.sendPrepareToAll(seq, n, v)
-		px.mu.Unlock()
+
+		chan1 := make(chan bool)
+		chan2 := make(chan interface{})
+		go px.sendPrepareToAll(seq, n, v, chan1, chan2)
+		
+		ok := <- chan1
 		if !ok {
 			continue
 		}
-		px.mu.Lock()
-		ok = px.sendAcceptToAll(seq, n, v1)
+		v1 := <- chan2 
+		
+		chan3 := make(chan bool)
+		go px.sendAcceptToAll(seq, n, v1, chan3)
+
+		ok = <- chan3
 		if ok {
-			px.sendDecidedToAll(seq, v1)
-			px.mu.Unlock()
+			go px.sendDecidedToAll(seq, v1)
 			break;
 		}
-		px.mu.Unlock()
 	}
 }
 
 func (px *Paxos) chooseProposalNumber(seq int) int {	
+	px.lock()     
 	n := px.accpState[seq].prepProposal
+	px.unlock()
 	return n + 1
 }
 
 func (px *Paxos) sendPrepareToAll(seq int, 
-	n int, v interface{}) (interface{}, bool) {
+	n int, v interface{}, chan1 chan<- bool, chan2 chan<- interface{}) {
 	cntok, maxna := 0, 0
 	var v1 interface{}
 	for _, peer := range px.peers {
 		na, va, ok := px.prepare(peer, seq, n)
 		if ok {
 			if na > maxna {
+				maxna = na
 				v1 = va
 			}
 			cntok++
 		}
 	}
-	if cntok > (len(px.peers) + 1) / 2 {
+	if cntok > len(px.peers) / 2 {
 		if maxna == 0 {
 			v1 = v
 		}
-		return v1, true
+		chan1 <- true 
+		chan2 <- v1
 	}
-	return nil, false
+	chan1 <- false
 }
 
 func (px *Paxos) self() string {
@@ -175,10 +196,7 @@ func (px *Paxos) prepare(peer string, seq int, n int) (int, interface{}, bool) {
 func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 	DPrintf("RPC Prepare : inst %d : prop %d : serv %s\n", 
 		args.Instance, args.Proposal, px.self())
-
-	px.mu.Lock()
 	n, v, ok := px.prepareHandler(args.Instance, args.Proposal)
-	px.mu.Unlock()
 	if ok {
 		reply.Err = OK
 		reply.Proposal, reply.Value = n, v
@@ -190,6 +208,8 @@ func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 
 func (px *Paxos) prepareHandler(seq int, n int) (int, interface{}, bool) {
 	px.updateMaxSeqSeen(seq)
+	px.lock()
+	defer px.unlock()
 	state := px.accpState[seq]
 	if n > state.prepProposal {
 		state.prepProposal = n
@@ -201,7 +221,7 @@ func (px *Paxos) prepareHandler(seq int, n int) (int, interface{}, bool) {
 	}
 }
 
-func (px *Paxos) sendAcceptToAll(seq int, n int, v interface{}) bool {
+func (px *Paxos) sendAcceptToAll(seq int, n int, v interface{}, okch chan<- bool) {
 	cntok := 0
 	for _, peer := range px.peers {
 		ok := px.accept(peer, seq, n, v)
@@ -209,10 +229,10 @@ func (px *Paxos) sendAcceptToAll(seq int, n int, v interface{}) bool {
 			cntok++
 		}
 	}
-	if cntok > (len(px.peers) + 1) / 2 {
-		return true
+	if cntok > len(px.peers) / 2 {
+		okch <- true
 	}
-	return false
+	okch <- false
 }
 
 func (px *Paxos) accept(peer string, seq int, n int, v interface{}) bool {
@@ -233,9 +253,7 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 	DPrintf("RPC Accept : inst %d : prop %d : value %v : serv %s\n", 
 		args.Instance, args.Proposal, args.Value, px.self())
 	
-	px.mu.Lock()
 	ok := px.acceptHandler(args.Instance, args.Proposal, args.Value)
-	px.mu.Unlock()
 	if ok {
 		reply.Err = OK
 	} else {
@@ -245,6 +263,8 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 }
 
 func (px *Paxos) acceptHandler(seq int, n int, v interface{}) bool {
+	px.lock()
+	defer px.unlock()
 	px.updateMaxSeqSeen(seq)
 	state := px.accpState[seq]
 	if n >= state.prepProposal {
@@ -277,15 +297,14 @@ func (px *Paxos) decided(peer string, seq int, v interface{}) {
 func (px *Paxos) Decided(args *DecidedArgs, reply *DecidedReply) error {
 	DPrintf("RPC Decided : inst %d : value %v : serv %s\n", 
 		args.Instance, args.Value, px.self())
-
-	px.mu.Lock()
 	px.decidedHandler(args.Instance, args.Value)
-	px.mu.Unlock()
 	return nil
 }
 
 func (px *Paxos) decidedHandler(seq int, v interface{}) {
+	px.lock()
 	px.values[seq] = v
+	px.unlock()
 }
 
 //
@@ -295,9 +314,9 @@ func (px *Paxos) decidedHandler(seq int, v interface{}) {
 // see the comments for Min() for more explanation.
 //
 func (px *Paxos) Done(seq int) {
-	px.mu.Lock()
-	defer px.mu.Unlock()
-	
+	px.lock()
+	defer px.unlock()
+
 	if seq <= px.done {
 		return
 	}
@@ -323,8 +342,8 @@ func (px *Paxos) erase(seq int) {
 // this peer.
 //
 func (px *Paxos) Max() int {
-	px.mu.Lock()
-	defer px.mu.Unlock()
+	px.lock()
+	defer px.unlock()
 
 	return px.maxSeqSeen
 }
@@ -358,8 +377,8 @@ func (px *Paxos) Max() int {
 // instances.
 //
 func (px *Paxos) Min() int {
-	px.mu.Lock()
-	defer px.mu.Unlock()
+	px.lock()
+	defer px.unlock()
 
 	if px.done >= 0 {
 		return px.done + 1
@@ -375,8 +394,8 @@ func (px *Paxos) Min() int {
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
-	px.mu.Lock()
-	defer px.mu.Unlock()
+	px.lock()
+	defer px.unlock()
 
 	if seq <= px.done {
 		return Forgotten, nil
@@ -435,6 +454,7 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	// Your initialization code here.
 	px.done = -1
 	px.maxSeqSeen = -1
+	
 	//px.status = make(map[int]Fate)
 	px.values = make(map[int]interface{})
 	px.accpState = make(map[int]State)
