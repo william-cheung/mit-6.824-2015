@@ -4,11 +4,14 @@ import "net/rpc"
 import "crypto/rand"
 import "math/big"
 
-import "fmt"
+//import "fmt"
+
+import "sync"
 
 type Clerk struct {
 	servers []string
 	// You will have to modify this struct.
+	mu      sync.Mutex
 }
 
 func nrand() int64 {
@@ -55,7 +58,7 @@ func call(srv string, rpcname string,
 		return true
 	}
 
-	fmt.Println(err)
+	//fmt.Println(err)
 	return false
 }
 
@@ -65,7 +68,24 @@ func call(srv string, rpcname string,
 // keeps trying forever in the face of all other errors.
 //
 func (ck *Clerk) Get(key string) string {
-	// You will have to modify this function.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	args := &GetArgs{Key:key}
+	args.OpID = nrand()
+	var reply GetReply
+	for {
+		for _, server := range ck.servers {
+			ok := call(server, "KVPaxos.Get", args, &reply)
+			if ok {
+				if reply.Err == OK {
+					return reply.Value
+				} else if reply.Err == ErrNoKey {
+					return ""
+				}
+			}
+		}
+	}
 	return ""
 }
 
@@ -74,6 +94,20 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	
+	args := &PutAppendArgs{Key:key, Value:value, Op:op}
+	args.OpID = nrand()
+	var reply PutAppendReply
+	for {
+		for _, server := range ck.servers {
+			ok := call(server, "KVPaxos.PutAppend", args, &reply)
+			if ok && reply.Err == OK {
+				return
+			}
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

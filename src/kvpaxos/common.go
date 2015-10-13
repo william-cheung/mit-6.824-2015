@@ -7,6 +7,12 @@ const (
 
 type Err string
 
+const (
+	Get     = "Get"
+	Put     = "Put"
+	Append  = "Append"
+)
+
 // Put or Append
 type PutAppendArgs struct {
 	// You'll have to add definitions here.
@@ -16,6 +22,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+
+	OpID  int64
 }
 
 type PutAppendReply struct {
@@ -25,9 +33,20 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+
+	OpID int64
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+func copyGetReply(dst *GetReply, src *GetReply) {
+	dst.Err = src.Err
+	dst.Value = src.Value
+}
+
+func copyPutAppendReply(dst *PutAppendReply, src *PutAppendReply) {
+	dst.Err = src.Err
 }

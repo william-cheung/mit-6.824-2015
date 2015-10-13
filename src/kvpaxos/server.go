@@ -12,21 +12,25 @@ import "syscall"
 import "encoding/gob"
 import "math/rand"
 
+import "time"
+import "lru"
 
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
+// for debugging
+const Debug = 1
+func DPrintf(format string, a ...interface{}) {
 	if Debug > 0 {
-		log.Printf(format, a...)
+		fmt.Printf(format, a...)
 	}
-	return
 }
-
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	OpID  int64
+	Op    string
+	Key   string
+	Value string
 }
 
 type KVPaxos struct {
@@ -38,17 +42,128 @@ type KVPaxos struct {
 	px         *paxos.Paxos
 
 	// Your definitions here.
+	lru        *lru.LRUCache
+	keyseqs    map[string]int
+	kvstore    map[string]string
 }
 
+const LRUCapacity = 1000000 
+
+func (kv *KVPaxos) filterDuplicate(opid int64, method string, reply interface{}) bool {
+	rp, ok := kv.lru.Get(opid)
+	if !ok {
+		return false
+	}
+
+	// bad design, because there would be various types 
+	// of operations to be filtered 
+	if method == Get {
+		reply, ok1 := reply.(*GetReply)
+		saved, ok2 := rp.(*GetReply) 
+		if ok1 && ok2 {
+			copyGetReply(reply, saved)
+			return true
+		}
+	} else if method == Put || method == Append {
+		reply, ok1 := reply.(*PutAppendReply)
+		saved, ok2 := rp.(*PutAppendReply)
+		if ok1 && ok2 {
+			copyPutAppendReply(reply, saved)
+			return true
+		}
+	}
+	return false
+}
+
+func (kv *KVPaxos) recordOperation(opid int64, reply interface{}) {
+	kv.lru.Put(opid, reply)
+}
+
+func (kv *KVPaxos) sync(xop *Op) {
+	seq := kv.keyseqs[xop.Key]
+	//DPrintf("sync ------------------------------------------------> opid %v\n", xop.OpID % 1000000000)
+	for {
+		fate, v := kv.px.Status(seq)
+		if fate == paxos.Decided {
+			op := v.(Op)
+			if xop.OpID == op.OpID {
+				break
+			} else if xop.Key == op.Key {
+				if op.Op == Put || op.Op == Append {
+					kv.doPutAppend(op.Op, op.Key, op.Value)
+				}
+			}	
+			seq++
+		} else {
+			kv.px.Start(seq, *xop)
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	kv.keyseqs[xop.Key] = seq + 1
+}
+
+func (kv *KVPaxos) doGet(key string) (value string, ok bool) {
+	//DPrintf("Get : server %d : key %s\n", kv.me, key)
+	value, ok = kv.kvstore[key]
+	if ok {
+		DPrintf("Get : server %d : key %s : value %s\n", kv.me, key, value)
+	} else {
+		DPrintf("Get : server %d : key %s : ErrNoKey\n", kv.me, key)
+	}
+	return 
+}
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
-	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	DPrintf("RPC Get : server %d : key %s\n", kv.me, args.Key)
+	
+	if kv.filterDuplicate(args.OpID, Get, reply) {
+		return nil
+	}
+	
+	xop := &Op{args.OpID, Get, args.Key, ""}
+	kv.sync(xop)
+	value, ok := kv.doGet(xop.Key)
+	if ok {
+		reply.Err = OK
+		reply.Value = value
+	} else {
+		reply.Err = ErrNoKey
+	}
+	
+	kv.recordOperation(args.OpID, reply)
+
 	return nil
 }
 
-func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
-	// Your code here.
+func (kv *KVPaxos) doPutAppend(op string, key string, value string) {
+	DPrintf("%s : server %d : key %s : value %s\n", op, kv.me, key, value)
+	if op == Put {
+		kv.kvstore[key] = value	
+	} else {
+		kv.kvstore[key] += value
+		DPrintf("--------------------------------> %s\n", kv.kvstore[key])
+	}
+}
 
+func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	DPrintf("RPC PutAppend : server %d : op %s : key %s : val %s\n", 
+		kv.me, args.Op, args.Key, args.Value)
+	
+	if kv.filterDuplicate(args.OpID, args.Op, reply) {
+		return nil
+	}
+	
+	xop := &Op{args.OpID, args.Op, args.Key, args.Value}
+	kv.sync(xop)
+	kv.doPutAppend(xop.Op, xop.Key, xop.Value)
+	reply.Err = OK
+	
+	kv.recordOperation(args.OpID, reply)
+	
 	return nil
 }
 
@@ -94,6 +209,9 @@ func StartServer(servers []string, me int) *KVPaxos {
 	kv.me = me
 
 	// Your initialization code here.
+	kv.lru = lru.New(LRUCapacity)
+	kv.keyseqs = make(map[string]int)
+	kv.kvstore = make(map[string]string)
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
