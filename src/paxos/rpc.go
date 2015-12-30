@@ -72,6 +72,9 @@ type AcceptReply struct {
 }
 
 type DecidedArgs struct {
+	Sender   int
+	DoneIns  int
+
 	Instance int
 	Value    interface{}
 }

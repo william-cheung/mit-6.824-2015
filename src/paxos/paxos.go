@@ -61,7 +61,9 @@ type Paxos struct {
 	me         int // index into peers[]
 
 	// Your data here.
-	done       int                   // any instance seq x <= done is forgotten
+	doneSeqs   []int                 // doneSeqs[i] is highest seq passed to Done() 
+	                                 // on peer i known to this peer
+
 	maxSeqSeen int                   // highest seq known to this peer
 
 	values     map[int]interface{}   // decided value of each instance	
@@ -95,11 +97,14 @@ func (px *Paxos) unlock() {
 // is reached.
 //
 func (px *Paxos) Start(seq int, v interface{}) {
-	px.mu.Lock()
-	defer px.mu.Unlock()
+	if seq < px.Min() {
+		return
+	}
 	
-	if seq <= px.done { return }
+	px.mu.Lock()
 	px.updateMaxSeqSeen(seq)
+	px.mu.Unlock()
+
 	go px.propose(seq, v)
 }
 
@@ -315,10 +320,12 @@ func (px *Paxos) sendDecidedToAll(seq int, v interface{}) {
 }
 
 func (px *Paxos) decided(peer string, seq int, v interface{}) {
+	px.mu.Lock()
+	defer px.mu.Unlock()
 	if px.isSelf(peer) {
-		px.decidedHandler(seq, v)
+		px.values[seq] = v
 	} else {
-		args := &DecidedArgs{seq, v}
+		args := &DecidedArgs{px.me, px.doneSeqs[px.me], seq, v}
 		var reply DecidedReply
 		go call(peer, "Paxos.Decided", args, &reply)
 	}
@@ -327,14 +334,13 @@ func (px *Paxos) decided(peer string, seq int, v interface{}) {
 func (px *Paxos) Decided(args *DecidedArgs, reply *DecidedReply) error {
 	DPrintf("RPC Decided : inst %d : value %v : serv %s\n", 
 		args.Instance, args.Value, px.self())
-	px.decidedHandler(args.Instance, args.Value)
-	return nil
-}
-
-func (px *Paxos) decidedHandler(seq int, v interface{}) {
 	px.mu.Lock()
-	px.values[seq] = v
+	px.values[args.Instance] = args.Value
+	if px.doneSeqs[args.Sender] < args.DoneIns {
+		px.doneSeqs[args.Sender] = args.DoneIns
+	}
 	px.mu.Unlock()
+	return nil
 }
 
 //
@@ -345,25 +351,30 @@ func (px *Paxos) decidedHandler(seq int, v interface{}) {
 //
 func (px *Paxos) Done(seq int) {
 	px.mu.Lock()
-	defer px.mu.Unlock()
-
-	if seq <= px.done {
-		return
+	if px.doneSeqs[px.me] < seq {
+		px.doneSeqs[px.me] = seq
 	}
-	px.done = seq
-	for ins := range px.values {
-		if ins <= seq {
-			px.erase(ins)
-		} else {
-			break
-		}
-	}
+	px.doMemShrink()
+	px.mu.Unlock()
 }
 
-func (px *Paxos) erase(seq int) {
-	//delete(status, seq)
-	delete(px.values, seq)
-	delete(px.accpState, seq)
+
+func (px *Paxos) doMemShrink() int {
+	// fmt.Printf("%v\n", px.doneSeqs)
+	mm := px.doneSeqs[px.me]
+	for i := range px.doneSeqs {
+		if mm > px.doneSeqs[i] {
+			mm = px.doneSeqs[i]
+		}
+	}
+	
+	for seq := range px.values {
+		if seq <= mm {
+			delete(px.values, seq)
+			delete(px.accpState, seq)
+		}
+	}
+	return mm
 }
 
 //
@@ -409,11 +420,8 @@ func (px *Paxos) Max() int {
 func (px *Paxos) Min() int {
 	px.mu.Lock()
 	defer px.mu.Unlock()
-
-	if px.done >= 0 {
-		return px.done + 1
-	}
-	return 0
+	
+	return px.doMemShrink() + 1
 }
 
 //
@@ -424,12 +432,13 @@ func (px *Paxos) Min() int {
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
+	if seq < px.Min() {
+		return Forgotten, nil
+	} 
+
 	px.mu.Lock()
 	defer px.mu.Unlock()
 
-	if seq <= px.done {
-		return Forgotten, nil
-	} 
 	v, ok := px.values[seq]
 	if ok {
 		return Decided, v
@@ -482,7 +491,11 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.me = me
 
 	// Your initialization code here.
-	px.done = -1
+	npeers := len(px.peers)
+	px.doneSeqs = make([]int, npeers)
+	for i := 0; i < npeers; i++ {
+		px.doneSeqs[i] = -1
+	}
 	px.maxSeqSeen = -1
 	
 	px.values = make(map[int]interface{})
