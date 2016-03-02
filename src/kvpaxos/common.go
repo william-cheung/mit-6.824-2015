@@ -34,7 +34,7 @@ type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
 
-	OpID int64
+	OpID  int64
 }
 
 type GetReply struct {
@@ -42,11 +42,3 @@ type GetReply struct {
 	Value string
 }
 
-func copyGetReply(dst *GetReply, src *GetReply) {
-	dst.Err = src.Err
-	dst.Value = src.Value
-}
-
-func copyPutAppendReply(dst *PutAppendReply, src *PutAppendReply) {
-	dst.Err = src.Err
-}

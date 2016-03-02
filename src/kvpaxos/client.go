@@ -6,12 +6,11 @@ import "math/big"
 
 //import "fmt"
 
-import "sync"
+//import "sync"
 
 type Clerk struct {
 	servers []string
 	// You will have to modify this struct.
-	mu      sync.Mutex
 }
 
 func nrand() int64 {
@@ -68,11 +67,8 @@ func call(srv string, rpcname string,
 // keeps trying forever in the face of all other errors.
 //
 func (ck *Clerk) Get(key string) string {
-	ck.mu.Lock()
-	defer ck.mu.Unlock()
-
-	args := &GetArgs{Key:key}
-	args.OpID = nrand()
+	args := &GetArgs{Key:key, OpID:nrand()}
+	DPrintf("client : Get %v\n", args)
 	var reply GetReply
 	for {
 		for _, server := range ck.servers {
@@ -94,11 +90,8 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	ck.mu.Lock()
-	defer ck.mu.Unlock()
-	
-	args := &PutAppendArgs{Key:key, Value:value, Op:op}
-	args.OpID = nrand()
+	args := &PutAppendArgs{Key:key, Value:value, Op:op, OpID:nrand()}
+	DPrintf("client : %v\n", args)
 	var reply PutAppendReply
 	for {
 		for _, server := range ck.servers {

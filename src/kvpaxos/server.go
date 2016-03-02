@@ -13,10 +13,9 @@ import "encoding/gob"
 import "math/rand"
 
 import "time"
-import "lru"
 
 // for debugging
-const Debug = 1
+const Debug = 0 
 func DPrintf(format string, a ...interface{}) {
 	if Debug > 0 {
 		fmt.Printf(format, a...)
@@ -33,6 +32,9 @@ type Op struct {
 	Value string
 }
 
+const TTLofFilter = 10
+const TickInterval = 100 * time.Millisecond
+
 type KVPaxos struct {
 	mu         sync.Mutex
 	l          net.Listener
@@ -42,64 +44,72 @@ type KVPaxos struct {
 	px         *paxos.Paxos
 
 	// Your definitions here.
-	lru        *lru.LRUCache
-	keyseqs    map[string]int
+	seq        int
+	
+	filters    map[int64]int
+	replies    map[int64]interface{}
 	kvstore    map[string]string
 }
 
-const LRUCapacity = 1000000 
-
-func (kv *KVPaxos) filterDuplicate(opid int64, method string, reply interface{}) bool {
-	rp, ok := kv.lru.Get(opid)
-	if !ok {
-		return false
+func (kv *KVPaxos) filterDuplicate(opid int64) (interface{}, bool) {
+	_, ok := kv.filters[opid] // kv.filters.Get(opid)
+	if !ok { // no filter found 
+		return nil, false
 	}
-
-	// bad design, because there would be various types 
-	// of operations to be filtered 
-	if method == Get {
-		reply, ok1 := reply.(*GetReply)
-		saved, ok2 := rp.(*GetReply) 
-		if ok1 && ok2 {
-			copyGetReply(reply, saved)
-			return true
-		}
-	} else if method == Put || method == Append {
-		reply, ok1 := reply.(*PutAppendReply)
-		saved, ok2 := rp.(*PutAppendReply)
-		if ok1 && ok2 {
-			copyPutAppendReply(reply, saved)
-			return true
-		}
-	}
-	return false
+	kv.filters[opid] = TTLofFilter
+	rp, _ := kv.replies[opid] //kv.replies.Get(opid)
+	return rp, true
 }
 
 func (kv *KVPaxos) recordOperation(opid int64, reply interface{}) {
-	kv.lru.Put(opid, reply)
+	kv.filters[opid] = TTLofFilter
+	kv.replies[opid] = reply
 }
 
 func (kv *KVPaxos) sync(xop *Op) {
-	seq := kv.keyseqs[xop.Key]
-	//DPrintf("sync ------------------------------------------------> opid %v\n", xop.OpID % 1000000000)
+	seq := kv.seq // kv.keyseqs[xop.Key]
+	DPrintf("----- server %d sync %v\n", kv.me, xop)
+	
+	wait_init := func() time.Duration {
+		return /* (1 + time.Duration(rand.Intn(4))) * */ 10 * time.Millisecond
+	}
+	
+	wait := wait_init()
 	for {
 		fate, v := kv.px.Status(seq)
 		if fate == paxos.Decided {
 			op := v.(Op)
+			DPrintf("----- server %d : seq %d : %v\n", kv.me, seq, op)
 			if xop.OpID == op.OpID {
 				break
-			} else if xop.Key == op.Key {
-				if op.Op == Put || op.Op == Append {
-					kv.doPutAppend(op.Op, op.Key, op.Value)
+			} else if op.Op == Put || op.Op == Append {
+				kv.doPutAppend(op.Op, op.Key, op.Value)
+				kv.recordOperation(op.OpID, &PutAppendReply{OK})
+			} else {
+				value, ok := kv.doGet(op.Key)
+				if ok {
+					kv.recordOperation(op.OpID, &GetReply{OK, value})
+				} else {
+					kv.recordOperation(op.OpID, &GetReply{ErrNoKey, ""})
 				}
-			}	
+			}
+			kv.px.Done(seq)
 			seq++
-		} else {
+			wait = wait_init()
+		} else { // Pending
+			if fate == paxos.Forgotten {
+				DPrintf("--- bug :( ---" )
+			}
+			DPrintf("----- server %d starts a new paxos instance : %d %v\n", kv.me, seq, xop)
 			kv.px.Start(seq, *xop)
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(wait)
+			if wait < time.Second {
+				wait *= 2
+			}
 		}
 	}
-	kv.keyseqs[xop.Key] = seq + 1
+	kv.px.Done(seq)
+	kv.seq = seq + 1
 }
 
 func (kv *KVPaxos) doGet(key string) (value string, ok bool) {
@@ -118,7 +128,11 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 	defer kv.mu.Unlock()
 	DPrintf("RPC Get : server %d : key %s\n", kv.me, args.Key)
 	
-	if kv.filterDuplicate(args.OpID, Get, reply) {
+	rp, yes := kv.filterDuplicate(args.OpID)
+	if yes {
+		DPrintf("dup-op detected : %v\n", args)
+		reply.Value = rp.(*GetReply).Value
+		reply.Err = rp.(*GetReply).Err
 		return nil
 	}
 	
@@ -153,7 +167,10 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	DPrintf("RPC PutAppend : server %d : op %s : key %s : val %s\n", 
 		kv.me, args.Op, args.Key, args.Value)
 	
-	if kv.filterDuplicate(args.OpID, args.Op, reply) {
+	rp, yes := kv.filterDuplicate(args.OpID) 
+	if yes {
+		DPrintf("dup-op detected : %v\n", args)
+		reply.Err = rp.(*PutAppendReply).Err
 		return nil
 	}
 	
@@ -165,6 +182,19 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	kv.recordOperation(args.OpID, reply)
 	
 	return nil
+}
+
+func (kv *KVPaxos) cleanFilters() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	for id := range kv.filters {
+		kv.filters[id]--
+		if kv.filters[id] <= 0 {
+			delete(kv.filters, id)
+			delete(kv.replies, id)
+		}
+	}
 }
 
 // tell the server to shut itself down.
@@ -209,8 +239,8 @@ func StartServer(servers []string, me int) *KVPaxos {
 	kv.me = me
 
 	// Your initialization code here.
-	kv.lru = lru.New(LRUCapacity)
-	kv.keyseqs = make(map[string]int)
+	kv.filters = make(map[int64]int)
+	kv.replies = make(map[int64]interface{})
 	kv.kvstore = make(map[string]string)
 
 	rpcs := rpc.NewServer()
@@ -255,6 +285,13 @@ func StartServer(servers []string, me int) *KVPaxos {
 				fmt.Printf("KVPaxos(%v) accept: %v\n", me, err.Error())
 				kv.kill()
 			}
+		}
+	}()
+
+	go func() {
+		for kv.isdead() == false {
+			time.Sleep(TickInterval)
+			kv.cleanFilters()
 		}
 	}()
 

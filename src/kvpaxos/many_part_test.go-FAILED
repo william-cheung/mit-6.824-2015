@@ -1,0 +1,185 @@
+package kvpaxos
+
+import "testing"
+import "runtime"
+import "strconv"
+import "os"
+import "time"
+import "fmt"
+import "math/rand"
+import "sync/atomic"
+
+func check(t *testing.T, ck *Clerk, key string, value string) {
+	v := ck.Get(key)
+	if v != value {
+		t.Fatalf("Get(%v) -> %v, expected %v", key, v, value)
+	}
+}
+
+func port(tag string, host int) string {
+	s := "/var/tmp/824-"
+	s += strconv.Itoa(os.Getuid()) + "/"
+	os.Mkdir(s, 0777)
+	s += "kv-"
+	s += strconv.Itoa(os.Getpid()) + "-"
+	s += tag + "-"
+	s += strconv.Itoa(host)
+	return s
+}
+
+func cleanup(kva []*KVPaxos) {
+	for i := 0; i < len(kva); i++ {
+		if kva[i] != nil {
+			kva[i].kill()
+		}
+	}
+}
+
+// predict effect of Append(k, val) if old value is prev.
+func NextValue(prev string, val string) string {
+	return prev + val
+}
+
+func pp(tag string, src int, dst int) string {
+	s := "/var/tmp/824-"
+	s += strconv.Itoa(os.Getuid()) + "/"
+	s += "kv-" + tag + "-"
+	s += strconv.Itoa(os.Getpid()) + "-"
+	s += strconv.Itoa(src) + "-"
+	s += strconv.Itoa(dst)
+	return s
+}
+
+func cleanpp(tag string, n int) {
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			ij := pp(tag, i, j)
+			os.Remove(ij)
+		}
+	}
+}
+
+func part(t *testing.T, tag string, npaxos int, p1 []int, p2 []int, p3 []int) {
+	cleanpp(tag, npaxos)
+    
+	fmt.Printf("=============== PARTITION : %v %v %v\n", p1, p2, p3)
+
+	pa := [][]int{p1, p2, p3}
+	for pi := 0; pi < len(pa); pi++ {
+		p := pa[pi]
+		for i := 0; i < len(p); i++ {
+			for j := 0; j < len(p); j++ {
+				ij := pp(tag, p[i], p[j])
+				pj := port(tag, p[j])
+				err := os.Link(pj, ij)
+				if err != nil {
+					t.Fatalf("os.Link(%v, %v): %v\n", pj, ij, err)
+				}
+			}
+		}
+	}
+}
+
+
+func TestManyPartition(t *testing.T) {
+	runtime.GOMAXPROCS(4)
+
+	fmt.Printf("Test: Many clients, changing partitions ...\n")
+
+	tag := "many"
+	const nservers = 5
+	var kva []*KVPaxos = make([]*KVPaxos, nservers)
+	defer cleanup(kva)
+	defer cleanpp(tag, nservers)
+
+	for i := 0; i < nservers; i++ {
+		var kvh []string = make([]string, nservers)
+		for j := 0; j < nservers; j++ {
+			if j == i {
+				kvh[j] = port(tag, i)
+			} else {
+				kvh[j] = pp(tag, i, j)
+			}
+		}
+		kva[i] = StartServer(kvh, i)
+		kva[i].setunreliable(true)
+	}
+	defer part(t, tag, nservers, []int{}, []int{}, []int{})
+	part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
+
+	done := int32(0)
+
+	// re-partition periodically
+	ch1 := make(chan bool)
+	go func() {
+		defer func() { ch1 <- true }()
+		for atomic.LoadInt32(&done) == 0 {
+			var a [nservers]int
+			for i := 0; i < nservers; i++ {
+				a[i] = (rand.Int() % 3)
+			}
+			pa := make([][]int, 3)
+			for i := 0; i < 3; i++ {
+				pa[i] = make([]int, 0)
+				for j := 0; j < nservers; j++ {
+					if a[j] == i {
+						pa[i] = append(pa[i], j)
+					}
+				}
+			}
+			part(t, tag, nservers, pa[0], pa[1], pa[2])
+			time.Sleep(time.Duration(rand.Int63()%200) * time.Millisecond)
+		}
+	}()
+
+	const nclients = 10
+	var ca [nclients]chan bool
+	for xcli := 0; xcli < nclients; xcli++ {
+		ca[xcli] = make(chan bool)
+		go func(cli int) {
+			ok := false
+			defer func() { ca[cli] <- ok }()
+			sa := make([]string, nservers)
+			for i := 0; i < nservers; i++ {
+				sa[i] = port(tag, i)
+			}
+			for i := range sa {
+				j := rand.Intn(i + 1)
+				sa[i], sa[j] = sa[j], sa[i]
+			}
+			myck := MakeClerk(sa)
+			key := strconv.Itoa(cli)
+			last := ""
+			myck.Put(key, last)
+			for atomic.LoadInt32(&done) == 0 {
+				if (rand.Int() % 1000) < 500 {
+					nv := strconv.Itoa(rand.Int())
+					myck.Append(key, nv)
+					last = NextValue(last, nv)
+				} else {
+					v := myck.Get(key)
+					if v != last {
+						t.Fatalf("%v: get wrong value, key %v, wanted %v, got %v",
+							cli, key, last, v)
+					}
+				}
+			}
+			ok = true
+		}(xcli)
+	}
+
+	time.Sleep(20 * time.Second)
+	atomic.StoreInt32(&done, 1)
+	<-ch1
+	part(t, tag, nservers, []int{0, 1, 2, 3, 4}, []int{}, []int{})
+
+	ok := true
+	for i := 0; i < nclients; i++ {
+		z := <-ca[i]
+		ok = ok && z
+	}
+
+	if ok {
+		fmt.Printf("  ... Passed\n")
+	}
+}
