@@ -15,7 +15,7 @@ import "math/rand"
 
 import "time"
 
-const Debug = 1
+const Debug = 0
 func DPrintf(format string, a ...interface{}) {
 	if Debug > 0 {
 		fmt.Printf(format, a...)
@@ -117,7 +117,6 @@ func (sm *ShardMaster) sync(xop *Op) {
 		fate, v := sm.px.Status(seq)
 		if fate == paxos.Decided {
 			op := v.(Op)
-			
 			if xop.OpID == op.OpID {
 				break
 			} else {		
@@ -128,7 +127,7 @@ func (sm *ShardMaster) sync(xop *Op) {
 			wait = wait_init()
 		} else { 
 			sm.px.Start(seq, *xop)
-
+			
 			time.Sleep(wait)
 			if wait < time.Second {	
 				wait *= 2		
@@ -202,15 +201,14 @@ func (sm *ShardMaster) rebalance(config *Config, op string, gid int64) {
 	}
 	max_nshards, max_gid := 0, int64(0)
 	min_nshards, min_gid := NShards + 1, int64(0)
-	for xgid, nshards := range count_map {
-		_, exists := config.Groups[xgid]
-		if exists {
-			if max_nshards < nshards {
-				max_nshards, max_gid = nshards, xgid
-			}
-			if min_nshards > nshards {
-				min_nshards, min_gid = nshards, xgid
-			}
+	for xgid := range config.Groups {
+		nshards := count_map[xgid]
+
+		if max_nshards < nshards {
+			max_nshards, max_gid = nshards, xgid
+		}
+		if min_nshards > nshards {
+			min_nshards, min_gid = nshards, xgid
 		}
 	}
 
