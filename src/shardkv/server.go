@@ -24,9 +24,20 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	Get      = "Get"
+	Put      = "Put"
+	Append   = "Append"
+	Reconf   = "Reconf"
+)
 
 type Op struct {
-	// Your definitions here.
+	OpID  int64
+	CID   string
+	Seq   int
+	Op	  string
+	Key   string
+	Value string
 }
 
 
@@ -41,18 +52,145 @@ type ShardKV struct {
 
 	gid int64 // my replica group ID
 
-	// Your definitions here.
+	config     shardmaster.Config
+	
+	store      map[string]string   // key-value store
+	op_seq     int                 // paxos seq-num, all ops whose corresponding seq-num are 
+	                               // less than log_seq have been applied to the key-value store
+	
+	// for at-most-once semantics
+	cli_seq    map[string]int          // map : client-id -> most recent request-seq-num from the corresponding client
+	replies    map[string]interface{}  // map : client-id -> answer to the last request
 }
 
+func (kv *KVPaxos) sync(xop *Op) {
+	seq := kv.op_seq
+	DPrintf("----- server %d sync %v\n", kv.me, xop)
+	
+	wait_init := func() time.Duration {
+		return 10 * time.Millisecond
+	}
+	
+	wait := wait_init()
+	for {
+		fate, v := kv.px.Status(seq)
+		if fate == paxos.Decided {
+			op := v.(Op)
+			DPrintf("----- server %d : seq %d : %v\n", kv.me, seq, op)
+			if xop.OpID == op.OpID {
+				break
+			} else if op.Op == Put || op.Op == Append {
+				kv.doPutAppend(op.Op, op.Key, op.Value)
+				kv.recordOperation(op.CID, op.Seq, &PutAppendReply{OK})
+			} else {
+				value, ok := kv.doGet(op.Key)
+				if ok {
+					kv.recordOperation(op.CID, op.Seq, &GetReply{OK, value})
+				} else {
+					kv.recordOperation(op.CID, op.Seq, &GetReply{ErrNoKey, ""})
+				}
+			}
+			kv.px.Done(seq)
+			seq++
+			wait = wait_init()
+		} else { // Pending
+			DPrintf("----- server %d starts a new paxos instance : %d %v\n", kv.me, seq, xop)
+			kv.px.Start(seq, *xop)
+			time.Sleep(wait)
+			if wait < time.Second {
+				wait *= 2
+			}
+		}
+	}
+	kv.px.Done(seq)
+	kv.op_seq = seq + 1
+}
+
+func (kv *KVPaxos) recordOperation(cid string, seq int, reply interface{}) {
+	kv.cli_seq[cid] = seq
+	kv.replies[cid] = reply
+}
+
+func (kv *KVPaxos) filterDuplicate(cid string, seq int) (interface{}, bool) {
+	last_seq = kv.cli_seq[cid]
+	if seq < last_seq {
+		return nil, true 
+	} else if seq == last_seq {
+		rp = kv.replies[cid]
+		return rp, true
+	} 
+	return nil, false
+}
+
+func (kv *KVPaxos) doGet(key string) (value string, ok bool) {
+	value, ok = kv.store[key]
+}
+
+func (kv *KVPaxos) doPutAppend(op string, key string, value string) {
+	if op == Put {
+		kv.store[key] = value
+	} else if op == Append {
+		kv.store[key] += value
+	}
+}
+	
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
-	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	rp, yes := kv.filterDuplicate(args.CID, args.Seq)
+	if yes {
+		DPrintf("dup-op detected : %v\n", args)
+		if rp != nil {
+			tmp_rp := rp.(*GetReply)
+			reply.Err, reply.Value = tmp_rp.Err, tmp_rp.Value
+		}
+		return nil
+	}
+
+	xop := &Op{OpID:nrand(), CID:args.CID, Seq:args.Seq, 
+		Op:Get, Key:args.Key}
+	kv.sync(xop)
+
+	value, ok := kv.doGet(args.Key)
+	if ok {
+		reply.Err, reply.Value = OK, value
+	} else {
+		reply.Err = ErrNoKey
+	}
+
+	kv.recordOperation(args.CID, args.Seq, reply)
+
 	return nil
 }
 
 // RPC handler for client Put and Append requests
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
-	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	
+	DPrintf("RPC PutAppend : server %d : op %s : key %s : val %s\n", 
+		kv.me, args.Op, args.Key, args.Value)
+	
+	rp, yes := kv.filterDuplicate(args.CID, args.Seq) 
+	if yes {
+		DPrintf("dup-op detected : %v\n", args)
+		if rp != nil {
+			reply.Err = rp.(*PutAppendReply).Err
+		}
+		return nil
+	}
+	
+	xop := &Op{OpID:nrand(), CID:args.CID, Seq:args.Seq,
+		Op:args.Op, Key:args.Key, Value:args.Value}
+	kv.sync(xop)
+
+	kv.doPutAppend(args.Op, args.Key, args.Value)
+	reply.Err = OK
+	
+	kv.recordOperation(args.CID, args.Seq, reply)
+
 	return nil
 }
 
