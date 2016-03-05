@@ -8,13 +8,10 @@ import "crypto/rand"
 import "math/big"
 
 import "time"
-import "sync"
 
 type Clerk struct {
 	vs *viewservice.Clerk
 	// Your declarations here
-	mu    sync.Mutex
-	me    string
 	view  *viewservice.View
 }
 
@@ -30,7 +27,6 @@ func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
 	// Your ck.* initializations here
-	ck.me = me
 	return ck
 }
 
@@ -84,6 +80,12 @@ func (ck *Clerk) getPrimary(userpc bool) string {
 	return ""
 }
 
+/**
+  * Note :
+  *   We can assume that each clerk has only one outstanding
+  *   Put or Get.
+  */
+
 //
 // fetch a key's value from the current primary;
 // if they key has never been set, return "".
@@ -92,15 +94,12 @@ func (ck *Clerk) getPrimary(userpc bool) string {
 // says the key doesn't exist (has never been Put().
 //
 func (ck *Clerk) Get(key string) string {
-	args := &GetArgs{Key:key}
-	args.OpID = nrand()	
+	args := &GetArgs{Key:key, OpID:nrand()}	
 	var reply GetReply
 	
 	userpc := false
 	for {
-		ck.mu.Lock()
 		primary := ck.getPrimary(userpc)
-		ck.mu.Unlock()
 
 		call(primary, "PBServer.Get", args, &reply)
 		
@@ -119,15 +118,12 @@ func (ck *Clerk) Get(key string) string {
 // send a Put or Append RPC
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := &PutAppendArgs{Key:key, Value:value, Method:op}
-	args.OpID = nrand()
+	args := &PutAppendArgs{Key:key, Value:value, Method:op, OpID:nrand()}
 	var reply PutAppendReply
 	
 	userpc := false
 	for {
-		ck.mu.Lock()
 		primary := ck.getPrimary(userpc)
-		ck.mu.Unlock()
 
 		call(primary, "PBServer.PutAppend", args, &reply)
 		
