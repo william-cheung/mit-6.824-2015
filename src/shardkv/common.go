@@ -13,6 +13,8 @@ const (
 	OK            = "OK"
 	ErrNoKey      = "ErrNoKey"
 	ErrWrongGroup = "ErrWrongGroup"
+
+	ErrNotReady   = "ErrNotReady"
 )
 
 type Err string
@@ -45,3 +47,12 @@ type GetReply struct {
 	Value string
 }
 
+type TransferStateArgs struct {
+	ConfigNum  int
+	Shard      int
+}
+
+type TransferStateReply struct {
+	Err     Err
+	XState  XState
+}

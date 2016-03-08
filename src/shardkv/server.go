@@ -40,6 +40,11 @@ type Op struct {
 	Value string
 }
 
+type XState struct {
+	kvstore  map[string]string
+	mrrsmap  map[string]int
+	replies  map[string]interface{}
+}
 
 type ShardKV struct {
 	mu         sync.Mutex
@@ -52,19 +57,16 @@ type ShardKV struct {
 
 	gid int64 // my replica group ID
 
+
+	seq        int
+
 	config     shardmaster.Config
 	
-	store      map[string]string   // key-value store
-	op_seq     int                 // paxos seq-num, all ops whose corresponding seq-num are 
-	                               // less than log_seq have been applied to the key-value store
-	
-	// for at-most-once semantics
-	cli_seq    map[string]int          // map : client-id -> most recent request-seq-num from the corresponding client
-	replies    map[string]interface{}  // map : client-id -> answer to the last request
+	xstate     XState
 }
 
-func (kv *KVPaxos) sync(xop *Op) {
-	seq := kv.op_seq
+func (kv *ShardKV) sync(xop *Op) {
+	seq := kv.seq
 	DPrintf("----- server %d sync %v\n", kv.me, xop)
 	
 	wait_init := func() time.Duration {
@@ -103,41 +105,54 @@ func (kv *KVPaxos) sync(xop *Op) {
 		}
 	}
 	kv.px.Done(seq)
-	kv.op_seq = seq + 1
+	kv.seq = seq + 1
 }
 
-func (kv *KVPaxos) recordOperation(cid string, seq int, reply interface{}) {
-	kv.cli_seq[cid] = seq
-	kv.replies[cid] = reply
+func (kv *ShardKV) recordOperation(cid string, seq int, reply interface{}) {
+	kv.xstate.mrrsmap[cid] = seq
+	kv.xstate.replies[cid] = reply
 }
 
-func (kv *KVPaxos) filterDuplicate(cid string, seq int) (interface{}, bool) {
-	last_seq = kv.cli_seq[cid]
+func (kv *ShardKV) filterDuplicate(cid string, seq int) (interface{}, bool) {
+	last_seq = kv.xstate.mrrsmap[cid]
 	if seq < last_seq {
 		return nil, true 
 	} else if seq == last_seq {
-		rp = kv.replies[cid]
+		rp = kv.xstate.replies[cid]
 		return rp, true
 	} 
 	return nil, false
 }
 
-func (kv *KVPaxos) doGet(key string) (value string, ok bool) {
-	value, ok = kv.store[key]
+// check if a key's shard is assigned to the server's group
+func (kv *ShardKV) checkGroup(key string) bool {
+	shard := key2shard(key)
+	if kv.gid != kv.config.Shards[shard] {
+		return false
+	}
+	return true
 }
 
-func (kv *KVPaxos) doPutAppend(op string, key string, value string) {
+func (kv *ShardKV) doGet(key string) (value string, ok bool) {
+	value, ok = kv.xstate.kvstore[key]
+}
+
+func (kv *ShardKV) doPutAppend(op string, key string, value string) {
 	if op == Put {
-		kv.store[key] = value
+		kv.xstate.kvstore[key] = value
 	} else if op == Append {
-		kv.store[key] += value
+		kv.xstate.kvstore[key] += value
 	}
 }
 	
-
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
+	if !kv.checkGroup(args.Key) {
+		reply.Err = ErrWrongGroup
+		return nil
+	}
 
 	rp, yes := kv.filterDuplicate(args.CID, args.Seq)
 	if yes {
@@ -165,6 +180,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	return nil
 }
 
+
 // RPC handler for client Put and Append requests
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	kv.mu.Lock()
@@ -173,6 +189,11 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	DPrintf("RPC PutAppend : server %d : op %s : key %s : val %s\n", 
 		kv.me, args.Op, args.Key, args.Value)
 	
+	if !kv.checkGroup(args.Key) {
+		reply.Err = ErrWrongGroup
+		return nil
+	}
+
 	rp, yes := kv.filterDuplicate(args.CID, args.Seq) 
 	if yes {
 		DPrintf("dup-op detected : %v\n", args)
@@ -194,11 +215,54 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	return nil
 }
 
+func (kv *ShardKV) reconfigure(config *shardmaster.Config) bool {
+	for shard := 0; shard < shardmaster.NShards; ++shard {
+		gid := kv.config.Shards[shard]
+		if config.Shards[shard] == kv.gid && gid != kv.gid {
+			if !kv.requestShard(gid, shard) 
+				return false
+		}
+	}
+	kv.config = *config
+	return true
+}
+
+func (kv *ShardKV) requestShard(gid int64, shard int) bool {
+	for _, server := range kv.config.Groups[gid] {
+		args := &TransferStateArgs
+		args.ConfigNum, args.Shard = kv.config.Num, shard
+		var reply TransferStateReply
+		ok := call(server, "ShardKV.TransferState", args, &reply)
+		if ok {
+			if reply.Err == OK {
+				kv.mergeXState(&reply.XState)	
+				return true
+			} 
+			break
+		}
+	}
+	return false
+}
+
+func (kv *ShardKV) TransferState(args *TransferStateArgs, reply *TransferStateReply) {
+	
+}
+
 //
 // Ask the shardmaster if there's a new configuration;
 // if so, re-configure.
 //
 func (kv *ShardKV) tick() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	latest_cofig := kv.sm.Query(-1)
+	for n := kv.config.Num + 1; n <= latest_cofig.Num; ++n {
+		config := kv.sm.Query(n)
+		if !kv.reconfigure(&config) {
+			break
+		}
+	}
 }
 
 // tell the server to shut itself down.
