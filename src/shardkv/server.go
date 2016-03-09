@@ -15,7 +15,7 @@ import "math/rand"
 import "shardmaster"
 
 
-const Debug = 0
+const Debug = 0 
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -41,9 +41,9 @@ type Op struct {
 }
 
 type XState struct {
-	kvstore  map[string]string
-	mrrsmap  map[string]int
-	replies  map[string]interface{}
+	KVStore  map[string]string
+	MRRSMap  map[string]int
+	Replies  map[string]interface{}
 }
 
 type ShardKV struct {
@@ -109,16 +109,16 @@ func (kv *ShardKV) sync(xop *Op) {
 }
 
 func (kv *ShardKV) recordOperation(cid string, seq int, reply interface{}) {
-	kv.xstate.mrrsmap[cid] = seq
-	kv.xstate.replies[cid] = reply
+	kv.xstate.MRRSMap[cid] = seq
+	kv.xstate.Replies[cid] = reply
 }
 
 func (kv *ShardKV) filterDuplicate(cid string, seq int) (interface{}, bool) {
-	last_seq = kv.xstate.mrrsmap[cid]
+	last_seq := kv.xstate.MRRSMap[cid]
 	if seq < last_seq {
 		return nil, true 
 	} else if seq == last_seq {
-		rp = kv.xstate.replies[cid]
+		rp := kv.xstate.Replies[cid]
 		return rp, true
 	} 
 	return nil, false
@@ -134,14 +134,15 @@ func (kv *ShardKV) checkGroup(key string) bool {
 }
 
 func (kv *ShardKV) doGet(key string) (value string, ok bool) {
-	value, ok = kv.xstate.kvstore[key]
+	value, ok = kv.xstate.KVStore[key]
+	return
 }
 
 func (kv *ShardKV) doPutAppend(op string, key string, value string) {
 	if op == Put {
-		kv.xstate.kvstore[key] = value
+		kv.xstate.KVStore[key] = value
 	} else if op == Append {
-		kv.xstate.kvstore[key] += value
+		kv.xstate.KVStore[key] += value
 	}
 }
 	
@@ -149,6 +150,8 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
+	DPrintf("RPC Get : server %d : args %v\n", kv.me, args)
+	
 	if !kv.checkGroup(args.Key) {
 		reply.Err = ErrWrongGroup
 		return nil
@@ -186,17 +189,18 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	
-	DPrintf("RPC PutAppend : server %d : op %s : key %s : val %s\n", 
-		kv.me, args.Op, args.Key, args.Value)
+	DPrintf("RPC PutAppend : server %d : args %v\n", kv.me, args)
 	
 	if !kv.checkGroup(args.Key) {
+		DPrintf("RPC PutAppend : ErrWrongGroup : server %d : args %v\n", kv.me, args)
+		DPrintf("--------------- config : %v\n", kv.config);
 		reply.Err = ErrWrongGroup
 		return nil
 	}
 
 	rp, yes := kv.filterDuplicate(args.CID, args.Seq) 
 	if yes {
-		DPrintf("dup-op detected : %v\n", args)
+		DPrintf("RPC PutAppend : server %d : dup-op detected %v\n", kv.me, args)
 		if rp != nil {
 			reply.Err = rp.(*PutAppendReply).Err
 		}
@@ -216,11 +220,12 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 }
 
 func (kv *ShardKV) reconfigure(config *shardmaster.Config) bool {
-	for shard := 0; shard < shardmaster.NShards; ++shard {
+	for shard := 0; shard < shardmaster.NShards; shard++ {
 		gid := kv.config.Shards[shard]
 		if config.Shards[shard] == kv.gid && gid != kv.gid {
-			if !kv.requestShard(gid, shard) 
+			if !kv.requestShard(gid, shard) { 
 				return false
+			}
 		}
 	}
 	kv.config = *config
@@ -229,23 +234,66 @@ func (kv *ShardKV) reconfigure(config *shardmaster.Config) bool {
 
 func (kv *ShardKV) requestShard(gid int64, shard int) bool {
 	for _, server := range kv.config.Groups[gid] {
-		args := &TransferStateArgs
+		args := &TransferStateArgs{}
 		args.ConfigNum, args.Shard = kv.config.Num, shard
 		var reply TransferStateReply
 		ok := call(server, "ShardKV.TransferState", args, &reply)
 		if ok {
 			if reply.Err == OK {
 				kv.mergeXState(&reply.XState)	
-				return true
-			} 
+			} else {
+				return false
+			}
 			break
 		}
 	}
-	return false
+	return true
 }
 
-func (kv *ShardKV) TransferState(args *TransferStateArgs, reply *TransferStateReply) {
+func (kv *ShardKV) TransferState(args *TransferStateArgs, reply *TransferStateReply) error {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	DPrintf("RPC TransferState : server %d : args %v\n", kv.me, args)
 	
+	if kv.config.Num < args.ConfigNum {
+		reply.Err = ErrNotReady
+		return nil
+	}
+	
+	reply.XState = XState{}
+	reply.XState.KVStore = map[string]string{}
+	for key := range kv.xstate.KVStore {
+		if key2shard(key) == args.Shard {
+			value := kv.xstate.KVStore[key]
+			reply.XState.KVStore[key] = value
+		}
+	}
+	reply.XState.MRRSMap = kv.xstate.MRRSMap
+	reply.XState.Replies = kv.xstate.Replies
+
+	reply.Err = OK
+	return nil
+}
+
+func (kv *ShardKV) initXState() {
+	kv.xstate.KVStore = map[string]string{}
+	kv.xstate.MRRSMap = map[string]int{}
+	kv.xstate.Replies = map[string]interface{}{}
+}
+
+func (kv *ShardKV) mergeXState(xstate *XState) {
+	for key, value := range xstate.KVStore {
+		kv.xstate.KVStore[key] = value
+	}
+
+	for client, seq := range xstate.MRRSMap {
+		xseq := kv.xstate.MRRSMap[client] 
+		if xseq < seq {
+			kv.xstate.MRRSMap[client] = seq
+			kv.xstate.Replies[client] = xstate.Replies[client]
+		}
+	}
 }
 
 //
@@ -256,8 +304,8 @@ func (kv *ShardKV) tick() {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	latest_cofig := kv.sm.Query(-1)
-	for n := kv.config.Num + 1; n <= latest_cofig.Num; ++n {
+	latest_config := kv.sm.Query(-1)
+	for n := kv.config.Num + 1; n <= latest_config.Num; n++ {
 		config := kv.sm.Query(n)
 		if !kv.reconfigure(&config) {
 			break
@@ -317,6 +365,7 @@ func StartServer(gid int64, shardmasters []string,
 
 	kv.px = paxos.Make(servers, me, rpcs)
 
+	kv.initXState()
 
 	os.Remove(servers[me])
 	l, e := net.Listen("unix", servers[me])

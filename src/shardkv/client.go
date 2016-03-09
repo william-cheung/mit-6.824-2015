@@ -8,6 +8,8 @@ import "fmt"
 import "crypto/rand"
 import "math/big"
 
+import "strconv"
+
 type Clerk struct {
 	mu     sync.Mutex // one RPC at a time
 	sm     *shardmaster.Clerk
@@ -110,7 +112,7 @@ func (ck *Clerk) Get(key string) string {
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
 				}
-				if ok && (reply.Err == ErrWrongGroup) {
+				if ok && reply.Err == ErrWrongGroup {
 					break
 				}
 			}
@@ -143,9 +145,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			// try each server in the shard's replication group.
 			for _, srv := range servers {
 				args := &PutAppendArgs{}
-				args.Key = key
-				args.Value = value
-				args.Op = op
+				args.Key, args.Value args.Op = key, value, op
 				args.CID, args.Seq = ck.me, ck.seq
 				var reply PutAppendReply
 				ok := call(srv, "ShardKV.PutAppend", args, &reply)
