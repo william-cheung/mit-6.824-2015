@@ -64,7 +64,7 @@ func call(srv string, rpcname string,
 		return true
 	}
 
-	fmt.Println(err)
+	// fmt.Println(err)
 	return false
 }
 
@@ -145,7 +145,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			// try each server in the shard's replication group.
 			for _, srv := range servers {
 				args := &PutAppendArgs{}
-				args.Key, args.Value args.Op = key, value, op
+				args.Key, args.Value, args.Op = key, value, op
 				args.CID, args.Seq = ck.me, ck.seq
 				var reply PutAppendReply
 				ok := call(srv, "ShardKV.PutAppend", args, &reply)

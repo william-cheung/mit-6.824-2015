@@ -40,10 +40,15 @@ type Op struct {
 	Value string
 }
 
+type Rep struct {
+	Err   Err
+	Value string
+}
+
 type XState struct {
 	KVStore  map[string]string
 	MRRSMap  map[string]int
-	Replies  map[string]interface{}
+	Replies  map[string]Rep
 }
 
 type ShardKV struct {
@@ -83,13 +88,13 @@ func (kv *ShardKV) sync(xop *Op) {
 				break
 			} else if op.Op == Put || op.Op == Append {
 				kv.doPutAppend(op.Op, op.Key, op.Value)
-				kv.recordOperation(op.CID, op.Seq, &PutAppendReply{OK})
+				kv.recordOperation(op.CID, op.Seq, &Rep{OK, ""})
 			} else {
 				value, ok := kv.doGet(op.Key)
 				if ok {
-					kv.recordOperation(op.CID, op.Seq, &GetReply{OK, value})
+					kv.recordOperation(op.CID, op.Seq, &Rep{OK, value})
 				} else {
-					kv.recordOperation(op.CID, op.Seq, &GetReply{ErrNoKey, ""})
+					kv.recordOperation(op.CID, op.Seq, &Rep{ErrNoKey, ""})
 				}
 			}
 			kv.px.Done(seq)
@@ -108,18 +113,18 @@ func (kv *ShardKV) sync(xop *Op) {
 	kv.seq = seq + 1
 }
 
-func (kv *ShardKV) recordOperation(cid string, seq int, reply interface{}) {
+func (kv *ShardKV) recordOperation(cid string, seq int, reply *Rep) {
 	kv.xstate.MRRSMap[cid] = seq
-	kv.xstate.Replies[cid] = reply
+	kv.xstate.Replies[cid] = *reply
 }
 
-func (kv *ShardKV) filterDuplicate(cid string, seq int) (interface{}, bool) {
+func (kv *ShardKV) filterDuplicate(cid string, seq int) (*Rep, bool) {
 	last_seq := kv.xstate.MRRSMap[cid]
 	if seq < last_seq {
 		return nil, true 
 	} else if seq == last_seq {
 		rp := kv.xstate.Replies[cid]
-		return rp, true
+		return &rp, true
 	} 
 	return nil, false
 }
@@ -161,8 +166,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	if yes {
 		DPrintf("dup-op detected : %v\n", args)
 		if rp != nil {
-			tmp_rp := rp.(*GetReply)
-			reply.Err, reply.Value = tmp_rp.Err, tmp_rp.Value
+			reply.Err, reply.Value = rp.Err, rp.Value
 		}
 		return nil
 	}
@@ -178,7 +182,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 		reply.Err = ErrNoKey
 	}
 
-	kv.recordOperation(args.CID, args.Seq, reply)
+	kv.recordOperation(args.CID, args.Seq, &Rep{reply.Err, reply.Value})
 
 	return nil
 }
@@ -202,7 +206,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	if yes {
 		DPrintf("RPC PutAppend : server %d : dup-op detected %v\n", kv.me, args)
 		if rp != nil {
-			reply.Err = rp.(*PutAppendReply).Err
+			reply.Err = rp.Err
 		}
 		return nil
 	}
@@ -214,12 +218,15 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	kv.doPutAppend(args.Op, args.Key, args.Value)
 	reply.Err = OK
 	
-	kv.recordOperation(args.CID, args.Seq, reply)
+	kv.recordOperation(args.CID, args.Seq, &Rep{reply.Err, ""})
 
 	return nil
 }
 
 func (kv *ShardKV) reconfigure(config *shardmaster.Config) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	for shard := 0; shard < shardmaster.NShards; shard++ {
 		gid := kv.config.Shards[shard]
 		if config.Shards[shard] == kv.gid && gid != kv.gid {
@@ -260,26 +267,28 @@ func (kv *ShardKV) TransferState(args *TransferStateArgs, reply *TransferStateRe
 		reply.Err = ErrNotReady
 		return nil
 	}
+
+	kv.initXState(&reply.XState)
 	
-	reply.XState = XState{}
-	reply.XState.KVStore = map[string]string{}
 	for key := range kv.xstate.KVStore {
 		if key2shard(key) == args.Shard {
 			value := kv.xstate.KVStore[key]
 			reply.XState.KVStore[key] = value
 		}
 	}
-	reply.XState.MRRSMap = kv.xstate.MRRSMap
-	reply.XState.Replies = kv.xstate.Replies
+	for client := range kv.xstate.MRRSMap {
+		reply.XState.MRRSMap[client] = kv.xstate.MRRSMap[client] 
+		reply.XState.Replies[client] = kv.xstate.Replies[client]
+	}
 
 	reply.Err = OK
 	return nil
 }
 
-func (kv *ShardKV) initXState() {
-	kv.xstate.KVStore = map[string]string{}
-	kv.xstate.MRRSMap = map[string]int{}
-	kv.xstate.Replies = map[string]interface{}{}
+func (kv *ShardKV) initXState(xstate *XState) {
+	xstate.KVStore = map[string]string{}
+	xstate.MRRSMap = map[string]int{}
+	xstate.Replies = map[string]Rep{}
 }
 
 func (kv *ShardKV) mergeXState(xstate *XState) {
@@ -301,8 +310,7 @@ func (kv *ShardKV) mergeXState(xstate *XState) {
 // if so, re-configure.
 //
 func (kv *ShardKV) tick() {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	DPrintf("---*--- tick ---*---\n")
 
 	latest_config := kv.sm.Query(-1)
 	for n := kv.config.Num + 1; n <= latest_config.Num; n++ {
@@ -365,7 +373,7 @@ func StartServer(gid int64, shardmasters []string,
 
 	kv.px = paxos.Make(servers, me, rpcs)
 
-	kv.initXState()
+	kv.initXState(&kv.xstate)
 
 	os.Remove(servers[me])
 	l, e := net.Listen("unix", servers[me])
