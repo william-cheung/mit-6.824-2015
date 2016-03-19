@@ -3,11 +3,11 @@ package shardkv
 import "net"
 import "fmt"
 import "net/rpc"
-import "log"
 import "time"
 import "paxos"
 import "sync"
 import "sync/atomic"
+import "log"
 import "os"
 import "syscall"
 import "encoding/gob"
@@ -15,11 +15,13 @@ import "math/rand"
 import "shardmaster"
 
 
-const Debug = 0 
+// Pass all tests except the concurrent-unreliable case
+
+const Debug = 1 
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
-		log.Printf(format, a...)
+		fmt.Printf(format, a...)
 	}
 	return
 }
@@ -33,8 +35,8 @@ const (
 
 type Op struct {
 	OpID  int64
-	CID   string
-	Seq   int
+	CID   string    // Client ID
+	Seq   int       // Cleint Seq
 	Op	  string
 	Key   string
 	Value string
@@ -45,7 +47,9 @@ type Rep struct {
 	Value string
 }
 
-type XState struct {
+// key/value store & client states
+// these data will be transferred between replica groups
+type XState struct { 	
 	KVStore  map[string]string
 	MRRSMap  map[string]int
 	Replies  map[string]Rep
@@ -63,7 +67,7 @@ type ShardKV struct {
 	gid int64 // my replica group ID
 
 
-	seq        int
+	seq        int   // seq of paxos instance
 
 	config     shardmaster.Config
 	
@@ -129,35 +133,42 @@ func (kv *ShardKV) filterDuplicate(cid string, seq int) (*Rep, bool) {
 	return nil, false
 }
 
-// check if a key's shard is assigned to the server's group
-func (kv *ShardKV) checkGroup(key string) bool {
+// Get replia group a key's shard is assigned to
+func (kv *ShardKV) getGroup(key string) int64 {
 	shard := key2shard(key)
-	if kv.gid != kv.config.Shards[shard] {
-		return false
-	}
-	return true
+	return kv.config.Shards[shard]
 }
 
 func (kv *ShardKV) doGet(key string) (value string, ok bool) {
 	value, ok = kv.xstate.KVStore[key]
+	DPrintf("doGet : server %d:%d : cleint %d : key %d : value %s\n", 
+		kv.gid, kv.me, key, value)
 	return
 }
 
 func (kv *ShardKV) doPutAppend(op string, key string, value string) {
+	value1 := kv.xstate.KVStore[key]
 	if op == Put {
 		kv.xstate.KVStore[key] = value
 	} else if op == Append {
 		kv.xstate.KVStore[key] += value
 	}
+	DPrintf("doPutAppend : server %d:%d : op %s : key %s : value %s->%s\n", 
+		kv.gid, kv.me, op, key, value1, kv.xstate.KVStore[key])
 }
 	
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	DPrintf("RPC Get : server %d : args %v\n", kv.me, args)
+	DPrintf("RPC Get : server %d:%d : cleint %d : seq %d : key %s\n", 
+		kv.gid, kv.me, args.CID, args.Seq, args.Key)
 	
-	if !kv.checkGroup(args.Key) {
+	gi := kv.getGroup(args.Key)
+	if gi != kv.gid {
+		DPrintf("RPC PutAppend : ErrWrongGroup : server %d:%d : key %s in gid %d\n", 
+			kv.gid, kv.me, args.Key, gi)
+		DPrintf("--------------- config : %v\n", kv.config);
 		reply.Err = ErrWrongGroup
 		return nil
 	}
@@ -193,10 +204,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	
-	DPrintf("RPC PutAppend : server %d : args %v\n", kv.me, args)
+	DPrintf("RPC PutAppend : server %d:%d : cleint %d : seq %d : op %s : key %s :value %s\n", 
+		kv.gid, kv.me, args.CID, args.Seq, args.Op, args.Key, args.Value)
 	
-	if !kv.checkGroup(args.Key) {
-		DPrintf("RPC PutAppend : ErrWrongGroup : server %d : args %v\n", kv.me, args)
+	gi := kv.getGroup(args.Key) 
+	if gi != kv.gid {
+		DPrintf("RPC PutAppend : ErrWrongGroup : server %d:%d : key %s in gid %d\n", 
+			kv.gid, kv.me, args.Key, gi)
 		DPrintf("--------------- config : %v\n", kv.config);
 		reply.Err = ErrWrongGroup
 		return nil
