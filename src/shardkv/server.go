@@ -17,7 +17,7 @@ import "shardmaster"
 
 // Pass all tests except the concurrent-unreliable case
 
-const Debug = 1 
+const Debug = 0 
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {

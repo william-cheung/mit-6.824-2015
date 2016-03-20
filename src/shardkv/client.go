@@ -4,7 +4,6 @@ import "shardmaster"
 import "net/rpc"
 import "time"
 import "sync"
-//import "fmt"
 import "crypto/rand"
 import "math/big"
 
@@ -26,11 +25,19 @@ func nrand() int64 {
 	return x
 }
 
+func gencid(isdummy bool) string {
+	x := nrand()
+	if isdummy {
+		x = int64(-1)
+	}
+	return strconv.FormatInt(x, 16)
+}
+
 func MakeClerk(shardmasters []string) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardmaster.MakeClerk(shardmasters)
 	// You'll have to modify MakeClerk.
-	ck.me = strconv.FormatInt(nrand(), 16)
+	ck.me = gencid(false)
 	return ck
 }
 
