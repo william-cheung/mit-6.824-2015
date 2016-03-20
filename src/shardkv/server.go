@@ -14,10 +14,9 @@ import "encoding/gob"
 import "math/rand"
 import "shardmaster"
 
-
 // Pass all tests except the concurrent-unreliable case
 
-const Debug = 0 
+const Debug = 0	
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -27,10 +26,10 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 const (
-	Get      = "Get"
-	Put      = "Put"
-	Append   = "Append"
-	Reconf   = "Reconf"
+	Get    = "Get"
+	Put    = "Put"
+	Append = "Append"
+	Reconf = "Reconf"
 )
 
 type Op struct {
@@ -40,6 +39,7 @@ type Op struct {
 	Op	  string
 	Key   string
 	Value string
+	Extra interface{}
 }
 
 type Rep struct {
@@ -47,12 +47,40 @@ type Rep struct {
 	Value string
 }
 
-// key/value store & client states
-// these data will be transferred between replica groups
+/**
+ * key/value store & client states
+ *     these data will be transferred between replica groups
+ */
 type XState struct { 	
 	KVStore  map[string]string
 	MRRSMap  map[string]int
 	Replies  map[string]Rep
+}
+
+func (xs *XState) Init() {
+	xs.KVStore = map[string]string{}
+	xs.MRRSMap = map[string]int{}
+	xs.Replies = map[string]Rep{}
+}
+
+func (xs *XState) Update(other *XState) {
+	for key, value := range other.KVStore {
+		xs.KVStore[key] = value
+	}
+
+	for cli, seq := range other.MRRSMap {
+		xseq := xs.MRRSMap[cli] 
+		if xseq < seq {
+			xs.MRRSMap[cli] = seq
+			xs.Replies[cli] = other.Replies[cli]
+		}
+	}
+}
+
+func MakeXState() (*XState) {
+	var xstate XState
+	xstate.Init()
+	return &xstate
 }
 
 type ShardKV struct {
@@ -66,44 +94,44 @@ type ShardKV struct {
 
 	gid int64 // my replica group ID
 
+	last_seq   int
+	seq        int  
 
-	seq        int   // seq of paxos instance
+	reconf_num int
+	reconf_seq int
 
 	config     shardmaster.Config
 	
 	xstate     XState
 }
 
-func (kv *ShardKV) sync(xop *Op) {
-	seq := kv.seq
-	DPrintf("----- server %d sync %v\n", kv.me, xop)
-	
-	wait_init := func() time.Duration {
-		return 10 * time.Millisecond
+func isSameOp(op1 *Op, op2 *Op) bool {
+	if op1.Op == op2.Op {
+		if op1.Op == Reconf {
+			return op1.Seq == op2.Seq
+		} 
+		return op1.OpID == op2.OpID
 	}
-	
-	wait := wait_init()
+	return false
+}
+
+func (kv *ShardKV) logOperation(xop *Op) {
+	seq := kv.seq
+
+	wait_init := 10 * time.Millisecond
+
+	DPrintf("----- server %d logOperation %v\n", kv.me, xop)
+	wait := wait_init
 	for {
 		fate, v := kv.px.Status(seq)
 		if fate == paxos.Decided {
 			op := v.(Op)
 			DPrintf("----- server %d : seq %d : %v\n", kv.me, seq, op)
-			if xop.OpID == op.OpID {
+			if isSameOp(xop, &op) {
 				break
-			} else if op.Op == Put || op.Op == Append {
-				kv.doPutAppend(op.Op, op.Key, op.Value)
-				kv.recordOperation(op.CID, op.Seq, &Rep{OK, ""})
-			} else {
-				value, ok := kv.doGet(op.Key)
-				if ok {
-					kv.recordOperation(op.CID, op.Seq, &Rep{OK, value})
-				} else {
-					kv.recordOperation(op.CID, op.Seq, &Rep{ErrNoKey, ""})
-				}
-			}
-			kv.px.Done(seq)
+			}			
 			seq++
-			wait = wait_init()
+			wait = wait_init
 		} else { // Pending
 			DPrintf("----- server %d starts a new paxos instance : %d %v\n", kv.me, seq, xop)
 			kv.px.Start(seq, *xop)
@@ -113,8 +141,33 @@ func (kv *ShardKV) sync(xop *Op) {
 			}
 		}
 	}
-	kv.px.Done(seq)
 	kv.seq = seq + 1
+}
+
+func (kv *ShardKV) catchUp() (rep *Rep) {
+	seq := kv.last_seq
+	for seq < kv.seq {
+		_, v := kv.px.Status(seq)
+		op := v.(Op)
+		if op.Op == Reconf {
+		} else if op.Op == Put || op.Op == Append {
+			kv.doPutAppend(op.Op, op.Key, op.Value)
+			rep = &Rep{OK, ""}
+			kv.recordOperation(op.CID, op.Seq, rep)
+		} else {
+			value, ok := kv.doGet(op.Key)
+			if ok {
+				rep = &Rep{OK, value}
+			} else {
+				rep = &Rep{ErrNoKey, ""}
+			}
+			kv.recordOperation(op.CID, op.Seq, rep)
+		}
+		kv.px.Done(seq)
+		seq++
+	}
+	kv.last_seq = seq
+	return
 }
 
 func (kv *ShardKV) recordOperation(cid string, seq int, reply *Rep) {
@@ -131,12 +184,6 @@ func (kv *ShardKV) filterDuplicate(cid string, seq int) (*Rep, bool) {
 		return &rp, true
 	} 
 	return nil, false
-}
-
-// Get replia group a key's shard is assigned to
-func (kv *ShardKV) getGroup(key string) int64 {
-	shard := key2shard(key)
-	return kv.config.Shards[shard]
 }
 
 func (kv *ShardKV) doGet(key string) (value string, ok bool) {
@@ -164,11 +211,10 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	DPrintf("RPC Get : server %d:%d : cleint %d : seq %d : key %s\n", 
 		kv.gid, kv.me, args.CID, args.Seq, args.Key)
 	
-	gi := kv.getGroup(args.Key)
-	if gi != kv.gid {
-		DPrintf("RPC PutAppend : ErrWrongGroup : server %d:%d : key %s in gid %d\n", 
-			kv.gid, kv.me, args.Key, gi)
-		DPrintf("--------------- config : %v\n", kv.config);
+	if kv.gid != kv.config.Shards[key2shard(args.Key)] {
+		DPrintf("RPC PutAppend : ErrWrongGroup : server %d:%d : key %s\n", 
+			kv.gid, kv.me, args.Key)
+		DPrintf("--------------- config : %v\n", kv.config)
 		reply.Err = ErrWrongGroup
 		return nil
 	}
@@ -182,18 +228,11 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 		return nil
 	}
 
-	xop := &Op{OpID:nrand(), CID:args.CID, Seq:args.Seq, 
-		Op:Get, Key:args.Key}
-	kv.sync(xop)
+	xop := &Op{OpID:nrand(), CID:args.CID, Seq:args.Seq, Op:Get, Key:args.Key}
+	kv.logOperation(xop)
 
-	value, ok := kv.doGet(args.Key)
-	if ok {
-		reply.Err, reply.Value = OK, value
-	} else {
-		reply.Err = ErrNoKey
-	}
-
-	kv.recordOperation(args.CID, args.Seq, &Rep{reply.Err, reply.Value})
+	rep := kv.catchUp()
+	reply.Err, reply.Value = rep.Err, rep.Value
 
 	return nil
 }
@@ -207,10 +246,9 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	DPrintf("RPC PutAppend : server %d:%d : cleint %d : seq %d : op %s : key %s :value %s\n", 
 		kv.gid, kv.me, args.CID, args.Seq, args.Op, args.Key, args.Value)
 	
-	gi := kv.getGroup(args.Key) 
-	if gi != kv.gid {
-		DPrintf("RPC PutAppend : ErrWrongGroup : server %d:%d : key %s in gid %d\n", 
-			kv.gid, kv.me, args.Key, gi)
+	if kv.gid != kv.config.Shards[key2shard(args.Key)] {
+		DPrintf("RPC PutAppend : ErrWrongGroup : server %d:%d : key %s\n", 
+			kv.gid, kv.me, args.Key)
 		DPrintf("--------------- config : %v\n", kv.config);
 		reply.Err = ErrWrongGroup
 		return nil
@@ -225,64 +263,70 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 		return nil
 	}
 	
-	xop := &Op{OpID:nrand(), CID:args.CID, Seq:args.Seq,
+	xop := &Op{OpID:nrand(), CID:args.CID, Seq:args.Seq, 
 		Op:args.Op, Key:args.Key, Value:args.Value}
-	kv.sync(xop)
-
-	kv.doPutAppend(args.Op, args.Key, args.Value)
-	reply.Err = OK
+	kv.logOperation(xop)
 	
-	kv.recordOperation(args.CID, args.Seq, &Rep{reply.Err, ""})
+	rep := kv.catchUp()
+	reply.Err = rep.Err
 
 	return nil
 }
 
 func (kv *ShardKV) reconfigure(config *shardmaster.Config) bool {
+	DPrintf("----- server %d:%d : reconfigure %v\n", kv.gid, kv.me, config)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
+	xstate := MakeXState()
 	for shard := 0; shard < shardmaster.NShards; shard++ {
 		gid := kv.config.Shards[shard]
 		if config.Shards[shard] == kv.gid && gid != kv.gid {
-			if !kv.requestShard(gid, shard) { 
+		 	ret := kv.requestShard(gid, shard)
+			if ret == nil {
 				return false
 			}
+			xstate.Update(ret)
 		}
 	}
+	kv.xstate.Update(xstate)
 	kv.config = *config
 	return true
 }
 
-func (kv *ShardKV) requestShard(gid int64, shard int) bool {
+func (kv *ShardKV) requestShard(gid int64, shard int) (*XState) {
+	DPrintf("----- server %d:%d : requestShard %d:%d\n", kv.gid, kv.me, gid, shard)
+	if gid == 0 {
+		return MakeXState()
+	}
+
 	for _, server := range kv.config.Groups[gid] {
 		args := &TransferStateArgs{}
 		args.ConfigNum, args.Shard = kv.config.Num, shard
 		var reply TransferStateReply
 		ok := call(server, "ShardKV.TransferState", args, &reply)
-		if ok {
-			if reply.Err == OK {
-				kv.mergeXState(&reply.XState)	
-			} else {
-				return false
-			}
-			break
+		if ok && reply.Err == OK {
+			return &reply.XState
 		}
 	}
-	return true
+	DPrintf("----- server %d:%d : requestShard FAIL %v\n", kv.gid, kv.me, kv.config)
+	return nil
 }
 
 func (kv *ShardKV) TransferState(args *TransferStateArgs, reply *TransferStateReply) error {
+	DPrintf("--- RPC TransferState : Deadlock ??? on server %d:%d\n", kv.gid, kv.me)
+
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	DPrintf("RPC TransferState : server %d : args %v\n", kv.me, args)
+	DPrintf("RPC TransferState : server %d:%d : args %v\n", kv.gid, kv.me, args)
 	
 	if kv.config.Num < args.ConfigNum {
 		reply.Err = ErrNotReady
 		return nil
-	}
+	} 
 
-	kv.initXState(&reply.XState)
+	reply.XState.Init()
 	
 	for key := range kv.xstate.KVStore {
 		if key2shard(key) == args.Shard {
@@ -299,32 +343,12 @@ func (kv *ShardKV) TransferState(args *TransferStateArgs, reply *TransferStateRe
 	return nil
 }
 
-func (kv *ShardKV) initXState(xstate *XState) {
-	xstate.KVStore = map[string]string{}
-	xstate.MRRSMap = map[string]int{}
-	xstate.Replies = map[string]Rep{}
-}
-
-func (kv *ShardKV) mergeXState(xstate *XState) {
-	for key, value := range xstate.KVStore {
-		kv.xstate.KVStore[key] = value
-	}
-
-	for client, seq := range xstate.MRRSMap {
-		xseq := kv.xstate.MRRSMap[client] 
-		if xseq < seq {
-			kv.xstate.MRRSMap[client] = seq
-			kv.xstate.Replies[client] = xstate.Replies[client]
-		}
-	}
-}
-
 //
 // Ask the shardmaster if there's a new configuration;
 // if so, re-configure.
 //
 func (kv *ShardKV) tick() {
-	DPrintf("---*--- tick ---*---\n")
+	DPrintf("---*--- tick ---*---\n")	
 
 	latest_config := kv.sm.Query(-1)
 	for n := kv.config.Num + 1; n <= latest_config.Num; n++ {
@@ -387,7 +411,7 @@ func StartServer(gid int64, shardmasters []string,
 
 	kv.px = paxos.Make(servers, me, rpcs)
 
-	kv.initXState(&kv.xstate)
+	kv.xstate.Init()
 
 	os.Remove(servers[me])
 	l, e := net.Listen("unix", servers[me])
