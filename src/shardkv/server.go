@@ -14,9 +14,7 @@ import "encoding/gob"
 import "math/rand"
 import "shardmaster"
 
-// Pass all tests except the concurrent-unreliable case
-
-const Debug = 1	
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -32,8 +30,11 @@ const (
 	Reconf = "Reconf"
 )
 
+//
+// Data structure for logging Get/Put/Append/Reconfigure
+// using Paxos  
+//
 type Op struct {
-	OpID  int64
 	CID   string    // Client ID
 	Seq   int       // Cleint Seq
 	Op	  string
@@ -42,15 +43,30 @@ type Op struct {
 	Extra interface{}
 }
 
+func (op *Op) IsSame(other* Op) bool {
+	if op.Op == other.Op {
+		if op.Op == Reconf {
+			// Seq refers to config_num in a 'Reconf' Op instance
+			return op.Seq == other.Seq
+		} 
+		return op.CID == other.CID && op.Seq == other.Seq
+	}
+	return false
+}
+
+//
+// Rep is compatible with GetReply and PutAppendReply
+//     is used for simplifying the code
+//
 type Rep struct {
 	Err   Err
 	Value string
 }
 
-/**
- * key/value store & client states
- *     these data will be transferred between replica groups
- */
+//
+// Key/value store & client states
+//     these data will be transferred between replica groups
+//
 type XState struct { 	
 	KVStore  map[string]string
 	MRRSMap  map[string]int
@@ -95,21 +111,11 @@ type ShardKV struct {
 	gid int64 // my replica group ID
 
 	last_seq   int
-	seq        int  
+	seq        int 
 
 	config     shardmaster.Config
 	
 	xstate     XState
-}
-
-func isSameOp(op1 *Op, op2 *Op) bool {
-	if op1.Op == op2.Op {
-		if op1.Op == Reconf {
-			return op1.Seq <= op2.Seq
-		} 
-		return op1.OpID == op2.OpID
-	}
-	return false
 }
 
 func (kv *ShardKV) logOperation(xop *Op) {
@@ -124,7 +130,7 @@ func (kv *ShardKV) logOperation(xop *Op) {
 		if fate == paxos.Decided {
 			op := v.(Op)
 			DPrintf("----- server %d:%d : seq %d : %v\n", kv.gid, kv.me, seq, op)
-			if isSameOp(xop, &op) {
+			if xop.IsSame(&op) {
 				break
 			}			
 			seq++
@@ -150,7 +156,7 @@ func (kv *ShardKV) catchUp() (rep *Rep) {
 			kv.config = kv.sm.Query(op.Seq)
 			extra := op.Extra.(XState)
 			kv.xstate.Update(&extra)
-			DPrintf("doReconf : server %d:%d : config %v\n", kv.gid, kv.me, kv.config)
+			//DPrintf("doReconf : server %d:%d : config %v\n", kv.gid, kv.me, kv.config)
 		} else if op.Op == Put || op.Op == Append {
 			rep = kv.doPutAppend(op.Op, op.Key, op.Value)
 			kv.recordOperation(op.CID, op.Seq, rep)
@@ -240,7 +246,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 		return nil
 	}
 
-	xop := &Op{OpID:nrand(), CID:args.CID, Seq:args.Seq, Op:Get, Key:args.Key}
+	xop := &Op{CID:args.CID, Seq:args.Seq, Op:Get, Key:args.Key}
 	kv.logOperation(xop)
 
 	rep := kv.catchUp()
@@ -257,14 +263,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	
 	DPrintf("RPC PutAppend : server %d:%d : cleint %d : seq %d : op %s : key %s :value %s\n", 
 		kv.gid, kv.me, args.CID, args.Seq, args.Op, args.Key, args.Value)
-	/*
-	if kv.gid != kv.config.Shards[key2shard(args.Key)] {
-		DPrintf("RPC PutAppend : ErrWrongGroup : server %d:%d : key %s\n", 
-			kv.gid, kv.me, args.Key)
-		DPrintf("--------------- config : %v\n", kv.config);
-		reply.Err = ErrWrongGroup
-		return nil
-	}*/
 
 	rp, yes := kv.filterDuplicate(args.CID, args.Seq) 
 	if yes {
@@ -275,7 +273,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 		return nil
 	}
 	
-	xop := &Op{OpID:nrand(), CID:args.CID, Seq:args.Seq, 
+	xop := &Op{CID:args.CID, Seq:args.Seq, 
 		Op:args.Op, Key:args.Key, Value:args.Value}
 	kv.logOperation(xop)
 	
@@ -287,13 +285,11 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 
 func (kv *ShardKV) reconfigure(config *shardmaster.Config) bool {
 	//DPrintf("----- server %d:%d : reconfigure %v\n", kv.gid, kv.me, config)
-	//kv.mu.Lock()
-	//defer kv.mu.Unlock()
 
 	xstate := MakeXState()
 	for shard := 0; shard < shardmaster.NShards; shard++ {
 		gid := kv.config.Shards[shard]
-		if config.Shards[shard] == kv.gid && gid != kv.gid {
+		if config.Shards[shard] == kv.gid && gid != 0 && gid != kv.gid {
 		 	ret := kv.requestShard(gid, shard)
 			if ret == nil {
 				return false
@@ -303,18 +299,12 @@ func (kv *ShardKV) reconfigure(config *shardmaster.Config) bool {
 	}
 	xop := &Op{Seq:config.Num, Op:Reconf, Extra:*xstate}
 	kv.logOperation(xop)
-	//kv.config = *config
-	//kv.xstate.Update(xstate)
 
 	return true
 }
 
 func (kv *ShardKV) requestShard(gid int64, shard int) (*XState) {
 	DPrintf("----- server %d:%d : requestShard %d:%d\n", kv.gid, kv.me, gid, shard)
-	if gid == 0 {
-		DPrintf("--- We have a invalid config\n")
-		return MakeXState()
-	}
 
 	for _, server := range kv.config.Groups[gid] {
 		args := &TransferStateArgs{}
@@ -330,17 +320,18 @@ func (kv *ShardKV) requestShard(gid int64, shard int) (*XState) {
 }
 
 func (kv *ShardKV) TransferState(args *TransferStateArgs, reply *TransferStateReply) error {
-	DPrintf("--- RPC TransferState : Deadlock ??? on server %d:%d\n", kv.gid, kv.me)
-
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	DPrintf("RPC TransferState : server %d:%d : args %v\n", kv.gid, kv.me, args)
-	
-	if kv.config.Num < args.ConfigNum {
+	if kv.config.Num <= args.ConfigNum {
 		reply.Err = ErrNotReady
 		return nil
 	} 
+
+	DPrintf("--- RPC TransferState : Deadlock ??? on server %d:%d with confignum %d vs args.ConfigNum %d\n", kv.gid, kv.me, kv.config.Num, args.ConfigNum)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	
+	DPrintf("RPC TransferState : server %d:%d : args %v\n", kv.gid, kv.me, args)
+	
 
 	reply.XState.Init()
 	
@@ -364,12 +355,13 @@ func (kv *ShardKV) TransferState(args *TransferStateArgs, reply *TransferStateRe
 // if so, re-configure.
 //
 func (kv *ShardKV) tick() {
-	DPrintf("---*--- tick ---*---\n")
+	DPrintf("server %d:%d ---*--- tick ---*---\n", kv.gid, kv.me)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
+	
+	// we catch up, in case we would log same ops as before
 	kv.catchUp()
-
+	
 	latest_config := kv.sm.Query(-1)
 	for n := kv.config.Num + 1; n <= latest_config.Num; n++ {
 		config := kv.sm.Query(n)
@@ -482,3 +474,4 @@ func StartServer(gid int64, shardmasters []string,
 
 	return kv
 }
+
