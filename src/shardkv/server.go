@@ -110,8 +110,8 @@ type ShardKV struct {
 
 	gid int64 // my replica group ID
 
-	last_seq   int
-	seq        int 
+	last_seq   int   // seq for next op to be applied
+	seq        int   // next seq in paxos log
 
 	config     shardmaster.Config
 	
@@ -156,7 +156,7 @@ func (kv *ShardKV) catchUp() (rep *Rep) {
 			kv.config = kv.sm.Query(op.Seq)
 			extra := op.Extra.(XState)
 			kv.xstate.Update(&extra)
-			//DPrintf("doReconf : server %d:%d : config %v\n", kv.gid, kv.me, kv.config)
+			DPrintf("doReconf : server %d:%d : config %d\n", kv.gid, kv.me, kv.config.Num)
 		} else if op.Op == Put || op.Op == Append {
 			rep = kv.doPutAppend(op.Op, op.Key, op.Value)
 			kv.recordOperation(op.CID, op.Seq, rep)
@@ -172,6 +172,7 @@ func (kv *ShardKV) catchUp() (rep *Rep) {
 }
 
 func (kv *ShardKV) recordOperation(cid string, seq int, reply *Rep) {
+	// we do not update the client state when ErrWrongGroup occurs
 	if reply.Err != ErrWrongGroup {
 		kv.xstate.MRRSMap[cid] = seq
 		kv.xstate.Replies[cid] = *reply
@@ -180,7 +181,7 @@ func (kv *ShardKV) recordOperation(cid string, seq int, reply *Rep) {
 
 func (kv *ShardKV) filterDuplicate(cid string, seq int) (*Rep, bool) {
 	last_seq := kv.xstate.MRRSMap[cid]
-	if seq < last_seq {
+	if seq < last_seq { 
 		return nil, true 
 	} else if seq == last_seq {
 		rep := kv.xstate.Replies[cid]
@@ -192,9 +193,8 @@ func (kv *ShardKV) filterDuplicate(cid string, seq int) (*Rep, bool) {
 func (kv *ShardKV) doGet(key string) (*Rep) {
 	var rep Rep
 	if kv.gid != kv.config.Shards[key2shard(key)] {
-		DPrintf("RPC PutAppend : ErrWrongGroup : server %d:%d : key %s\n", 
-			kv.gid, kv.me, key)
-		DPrintf("--------------- config : %v\n", kv.config)
+		DPrintf("doGet       : ErrWrongGroup : server %d:%d : key %s\n", kv.gid, kv.me, key)
+		DPrintf("------------- config : %v\n", kv.config)
 		rep.Err = ErrWrongGroup
 	} else {
 		value, ok := kv.xstate.KVStore[key]
@@ -212,9 +212,8 @@ func (kv *ShardKV) doGet(key string) (*Rep) {
 func (kv *ShardKV) doPutAppend(op string, key string, value string) (*Rep) {
 	var rep Rep
 	if kv.gid != kv.config.Shards[key2shard(key)] {
-		DPrintf("RPC PutAppend : ErrWrongGroup : server %d:%d : key %s\n", 
-			kv.gid, kv.me, key)
-		DPrintf("--------------- config : %v\n", kv.config)
+		DPrintf("doPutAppend : ErrWrongGroup : server %d:%d : key %s\n", kv.gid, kv.me, key)
+		DPrintf("------------- config : %v\n", kv.config)
 		rep.Err = ErrWrongGroup
 	} else {
 		value1 := kv.xstate.KVStore[key]
@@ -234,12 +233,15 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	DPrintf("RPC Get : server %d:%d : cleint %d : seq %d : key %s\n", 
+	DPrintf("RPC Get : server %d:%d : cleint %s : seq %d : key %s\n", 
 		kv.gid, kv.me, args.CID, args.Seq, args.Key)
+	
+	// we catch up to update the client states
+	kv.catchUp()
 
 	rp, yes := kv.filterDuplicate(args.CID, args.Seq)
 	if yes {
-		DPrintf("dup-op detected : %v\n", args)
+		DPrintf("RPC Get : server %d:%d : dup-op detected : %v\n", kv.gid, kv.me, args)
 		if rp != nil {
 			reply.Err, reply.Value = rp.Err, rp.Value
 		}
@@ -261,20 +263,21 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	
-	DPrintf("RPC PutAppend : server %d:%d : cleint %d : seq %d : op %s : key %s :value %s\n", 
+	DPrintf("RPC PutAppend : server %d:%d : cleint %s : seq %d : op %s : key %s :value %s\n", 
 		kv.gid, kv.me, args.CID, args.Seq, args.Op, args.Key, args.Value)
+
+	kv.catchUp()
 
 	rp, yes := kv.filterDuplicate(args.CID, args.Seq) 
 	if yes {
-		DPrintf("RPC PutAppend : server %d : dup-op detected %v\n", kv.me, args)
+		DPrintf("RPC PutAppend : server %d:%d : dup-op detected %v\n", kv.gid, kv.me, args)
 		if rp != nil {
 			reply.Err = rp.Err
 		}
 		return nil
 	}
 	
-	xop := &Op{CID:args.CID, Seq:args.Seq, 
-		Op:args.Op, Key:args.Key, Value:args.Value}
+	xop := &Op{CID:args.CID, Seq:args.Seq, Op:args.Op, Key:args.Key, Value:args.Value}
 	kv.logOperation(xop)
 	
 	rep := kv.catchUp()
@@ -285,13 +288,16 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 
 func (kv *ShardKV) reconfigure(config *shardmaster.Config) bool {
 	//DPrintf("----- server %d:%d : reconfigure %v\n", kv.gid, kv.me, config)
+	
+	// we catch up to ensure that kv.config.Num equals config.Num - 1
+	kv.catchUp()
 
 	xstate := MakeXState()
 	for shard := 0; shard < shardmaster.NShards; shard++ {
 		gid := kv.config.Shards[shard]
 		if config.Shards[shard] == kv.gid && gid != 0 && gid != kv.gid {
 		 	ret := kv.requestShard(gid, shard)
-			if ret == nil {
+			if ret == nil { 
 				return false
 			}
 			xstate.Update(ret)
@@ -320,18 +326,20 @@ func (kv *ShardKV) requestShard(gid int64, shard int) (*XState) {
 }
 
 func (kv *ShardKV) TransferState(args *TransferStateArgs, reply *TransferStateReply) error {
-	if kv.config.Num <= args.ConfigNum {
+	DPrintf("RPC TransferState : Deadlock ? : server %d:%d ConfigNum %d vs args.ConfigNum %d\n", 
+		kv.gid, kv.me, kv.config.Num, args.ConfigNum)
+	
+	// we check if we have older config than the client-server's 
+	// it's ok to use kv.config.Num here :)
+	if kv.config.Num < args.ConfigNum {
 		reply.Err = ErrNotReady
 		return nil
 	} 
-
-	DPrintf("--- RPC TransferState : Deadlock ??? on server %d:%d with confignum %d vs args.ConfigNum %d\n", kv.gid, kv.me, kv.config.Num, args.ConfigNum)
+	
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	
 	DPrintf("RPC TransferState : server %d:%d : args %v\n", kv.gid, kv.me, args)
-	
 
 	reply.XState.Init()
 	
@@ -361,7 +369,7 @@ func (kv *ShardKV) tick() {
 	
 	// we catch up, in case we would log same ops as before
 	kv.catchUp()
-	
+
 	latest_config := kv.sm.Query(-1)
 	for n := kv.config.Num + 1; n <= latest_config.Num; n++ {
 		config := kv.sm.Query(n)

@@ -19,6 +19,18 @@ const (
 
 type Err string
 
+type GetArgs struct {
+	Key    string
+	// You'll have to add definitions here.
+	CID    string  // client identifier
+	Seq    int     // request seq
+}
+
+type GetReply struct {
+	Err   Err
+	Value string
+}
+
 type PutAppendArgs struct {
 	Key    string
 	Value  string
@@ -33,18 +45,6 @@ type PutAppendArgs struct {
 
 type PutAppendReply struct {
 	Err Err
-}
-
-type GetArgs struct {
-	Key    string
-	// You'll have to add definitions here.
-	CID    string
-	Seq    int
-}
-
-type GetReply struct {
-	Err   Err
-	Value string
 }
 
 type TransferStateArgs struct {

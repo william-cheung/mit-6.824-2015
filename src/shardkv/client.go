@@ -25,19 +25,11 @@ func nrand() int64 {
 	return x
 }
 
-func gencid(isdummy bool) string {
-	x := nrand()
-	if isdummy {
-		x = int64(-1)
-	}
-	return strconv.FormatInt(x, 16)
-}
-
 func MakeClerk(shardmasters []string) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardmaster.MakeClerk(shardmasters)
 	// You'll have to modify MakeClerk.
-	ck.me = gencid(false)
+	ck.me = strconv.FormatInt(nrand(), 16)
 	return ck
 }
 
@@ -99,7 +91,6 @@ func (ck *Clerk) Get(key string) string {
 	defer ck.mu.Unlock()
 
 	// You'll have to modify Get().
-
 	ck.seq++
 
 	for {
@@ -138,7 +129,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	defer ck.mu.Unlock()
 
 	// You'll have to modify PutAppend().
-
 	ck.seq++
 	
 	for {
