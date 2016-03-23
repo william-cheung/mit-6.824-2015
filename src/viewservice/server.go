@@ -28,26 +28,18 @@ type ViewServer struct {
 	// Your declarations here.
 	view     *View                 // current view				
 	newv     *View                 // new view
-	packed   bool                  // is current view acked by the primary
+	packed   bool                  // has the current view acked by its primary
 	pttl     int                   // ttl of current primary
 	bttl     int                   // ttl of current backup 
-	svrset   map[string]int        // extra servers, server address -> ttl
+	idle_servers map[string]int    // extra servers, server address -> ttl
 }
 
 func create_view(viewno uint, primary string, backup string) (view *View) {
 	view = new(View)
 	view.Viewnum = viewno
 	view.Primary = primary
-	view.Backup = backup
+	view.Backup  = backup
 	return
-}
-
-func (vs *ViewServer) is_primary_dead() bool {
-	return vs.pttl <= 0
-}
-
-func (vs *ViewServer) is_backup_dead() bool {
-	return vs.bttl <= 0
 }
 
 func (vs *ViewServer) print_view() {
@@ -79,16 +71,18 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 			// restarted p is treated as dead
 			if client == vs.view.Primary { 
 				DPrintf("primary was restarted\n");
-				vs.pttl = 0;
+				vs.pttl = 0;  // set primary dead
 				if (vs.packed && vs.switch_to_new_view()) {
 					vs.packed = false
 				}
 			} 
 			// handle extra servers
 			if client != "" && client != vs.view.Backup { 
-				// BUG : if client is not a server
-				vs.svrset[client] = DeadPings
+				// if a client is not a server, it may steal the whole data base ;)
+				vs.idle_servers[client] = DeadPings
 			}
+
+			// if client == vs.view.Backup, we do nothing
 		}
 	} else {
 		if client == vs.view.Primary {
@@ -110,7 +104,7 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 	} else if client == vs.view.Backup {
 		vs.bttl = DeadPings
 	} else {
-		vs.svrset[client] = DeadPings
+		vs.idle_servers[client] = DeadPings
 	}
 	
 	reply.View = *vs.view
@@ -142,27 +136,38 @@ func (vs *ViewServer) update_newv(primary string, backup string) {
 	}
 }
 
-func get_and_del(m *map[string]int) string {
-	for elem := range *m {
-		delete(*m, elem)
-		DPrintf("select server : %s\n", elem);
-		return elem
+func get_and_del(idle_servers *map[string]int) string {
+	for server := range *idle_servers {
+		delete(*idle_servers, server)
+		DPrintf("select server : %s\n", server);
+		return server
 	}
 	return ""
 }
 
+//
+// The view service proceeds to a new view 
+//     1) if it hasn't received recent Pings from both primary and backup
+//     2) if the primary or backup crashed and restarted
+//     3) if there is no backup and there is an idle server
+//
+// Before we call this func, we should ensure that the primary has acked to
+// the current viewnum (vs.view.Viewnnum)
+//
 func (vs *ViewServer) switch_to_new_view() bool {
-	if vs.view.Backup == "" && len(vs.svrset) == 0 {
+	view = vs.view
+	if view.Backup == "" && len(vs.idle_servers) == 0 {
 		return false
 	}
-	if !vs.is_primary_dead() && vs.is_backup_dead() {
-		vs.update_newv(
-			vs.view.Primary, get_and_del(&vs.svrset))
-	} else if vs.is_primary_dead() && !vs.is_backup_dead() {
-		vs.update_newv(
-			vs.view.Backup, get_and_del(&vs.svrset))
-	} else if vs.is_primary_dead() && vs.is_backup_dead() {
-		// uninitialized servers cannot be promoted to primary
+	if vs.pttl > 0 && vs.bttl <= 0 {
+		// case 2, 3 : there is no backup or the backup is dead
+		vs.update_newv(view.Primary, get_and_del(&vs.idle_servers))
+	} else if vs.pttl <= 0 && vs.bttl > 0 {
+		// case 2 : the primary crashed or restarted
+		vs.update_newv(view.Backup, get_and_del(&vs.idle_servers))
+	} else if vs.pttl <= 0 && vs.bttl <= 0 {   
+		// case 1 : both primary and backup are dead in our view
+		// uninitialized idle servers cannot be promoted to primary
 		vs.update_newv("", "")
 	}
 	return vs.do_view_switch()
@@ -177,11 +182,11 @@ func (vs *ViewServer) do_view_switch() bool {
 }
 
 func (vs *ViewServer) cleanup_extra_servers() {
-	for server := range vs.svrset {
-		if vs.svrset[server] <= 0 {
-			delete(vs.svrset, server)
+	for server := range vs.idle_servers {
+		if vs.idle_servers[server] <= 0 {
+			delete(vs.idle_servers, server)
 		} else {
-			vs.svrset[server]--
+			vs.idle_servers[server]--
 		}
 	}	
 }
@@ -208,7 +213,7 @@ func (vs *ViewServer) tick() {
 	// case : no primary and no backup
 	if vs.view.Primary == "" { vs.pttl = 0 }
 	// case : old backup is promoted to primary
-	//        and there're no extra servers 
+	//        and there're no idle servers 
 	if vs.view.Backup  == "" { vs.bttl = 0 }
 	
 	if vs.pttl > 0 { vs.pttl-- }
@@ -241,7 +246,7 @@ func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
 	// Your vs.* initializations here.
-	vs.svrset = make(map[string] int)
+	vs.idle_servers = make(map[string] int)
 
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
