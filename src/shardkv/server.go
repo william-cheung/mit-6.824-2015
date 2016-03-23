@@ -31,7 +31,7 @@ const (
 )
 
 //
-// Data structure for logging Get/Put/Append/Reconfigure
+// Data structure for logging Get/Put/Append/Reconfigure ops
 // using Paxos  
 //
 type Op struct {
@@ -46,7 +46,7 @@ type Op struct {
 func (op *Op) IsSame(other* Op) bool {
 	if op.Op == other.Op {
 		if op.Op == Reconf {
-			// Seq refers to config_num in a 'Reconf' Op instance
+			// Seq refers to config_num in 'Reconf' cases
 			return op.Seq == other.Seq
 		} 
 		return op.CID == other.CID && op.Seq == other.Seq
@@ -56,7 +56,7 @@ func (op *Op) IsSame(other* Op) bool {
 
 //
 // Rep is compatible with GetReply and PutAppendReply
-//     is used for simplifying the code
+//     is used for simplifying the implemetation
 //
 type Rep struct {
 	Err   Err
@@ -66,11 +66,19 @@ type Rep struct {
 //
 // Key/value store & client states
 //     these data will be transferred between replica groups
+//     when the configuration is changed
 //
 type XState struct { 	
-	KVStore  map[string]string
-	MRRSMap  map[string]int
+	// key-value store
+	KVStore  map[string]string 
+	//_________________________________________________________
+	// client states for filtering duplicate ops
+
+	// map client -> the Most Recent Request Seq of the client
+	MRRSMap  map[string]int     	
+	// map client -> the most recent apply to the client
 	Replies  map[string]Rep
+	//_________________________________________________________
 }
 
 func (xs *XState) Init() {
@@ -147,6 +155,10 @@ func (kv *ShardKV) logOperation(xop *Op) {
 	kv.seq = seq + 1
 }
 
+// 
+// we let this func return the reply of the last Get/Put/Append op
+// for simplifying our implementation of RPC Get/PutAppend 
+//
 func (kv *ShardKV) catchUp() (rep *Rep) {
 	seq := kv.last_seq
 	for seq < kv.seq {
@@ -236,7 +248,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	DPrintf("RPC Get : server %d:%d : cleint %s : seq %d : key %s\n", 
 		kv.gid, kv.me, args.CID, args.Seq, args.Key)
 	
-	// we catch up to update the client states
+	// we catch up to update the client states (filters actually)
 	kv.catchUp()
 
 	rp, yes := kv.filterDuplicate(args.CID, args.Seq)
