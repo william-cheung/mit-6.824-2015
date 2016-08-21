@@ -72,13 +72,15 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 			if client == vs.view.Primary { 
 				DPrintf("primary was restarted\n");
 				vs.pttl = 0;  // set primary dead
+				// if the current view is acked by its primary, try to switch to 
+				// a new view
 				if (vs.packed && vs.switch_to_new_view()) {
 					vs.packed = false
 				}
 			} 
 			// handle extra servers
 			if client != "" && client != vs.view.Backup { 
-				// if a client is not a server, it may steal the whole data base ;)
+				// if a client is not a server, it may steal the whole database ;)
 				vs.idle_servers[client] = DeadPings
 			}
 
@@ -88,7 +90,7 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 		if client == vs.view.Primary {
 			if viewno == vs.view.Viewnum {
 				DPrintf("primary Acked the %d-th view\n", viewno);
-				// try to switch to the new view
+				// try to switch to a new view
 				if (vs.do_view_switch()) {
 					vs.packed = false
 				} else {
